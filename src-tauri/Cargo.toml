@@ -1,0 +1,51 @@
+[package]
+name = "digital-mess-cleaner"
+version = "0.1.1"
+description = "Your files. Understood. Organised. Clean."
+authors = ["Digital Mess Cleaner"]
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "digital_mess_cleaner_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+rusqlite = { version = "0.42", features = ["bundled"] }
+blake3 = "1"
+walkdir = "2"
+image = { version = "0.25", default-features = false, features = [
+  "jpeg",
+  "png",
+  "gif",
+  "webp",
+  "bmp",
+  "tiff",
+] }
+uuid = { version = "1", features = ["v4"] }
+dunce = "1"
+unicode-normalization = "0.1"
+mime_guess = "2"
+regex = "1"
+chrono = { version = "0.4", features = ["clock"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+pdf-extract = "0.7"
+sysinfo = "0.33"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

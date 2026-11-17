@@ -1,0 +1,11 @@
+node_modules/
+dist/
+dist-ssr/
+*.local
+coverage/
+.vite/
+.DS_Store
+Thumbs.db
+src-tauri/target/
+src-tauri/gen/
+*.log
