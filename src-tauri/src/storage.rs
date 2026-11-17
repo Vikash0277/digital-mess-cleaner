@@ -1,25 +1,198 @@
 //! Storage analysis: dashboards, category breakdowns, largest items, forgotten
 //! files, snapshots, growth prediction and cleanup suggestions.
 
+use crate::db;
 use crate::error::AppResult;
 use crate::fsutil;
 use crate::models::*;
 use crate::repo;
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use sysinfo::Disks;
 
-pub fn category_breakdown(conn: &Connection) -> AppResult<Vec<CategoryStat>> {
+/// Every aggregate that needs a pass over the whole `files` table, collected in
+/// one query. On a multi-million-row index a single pass costs seconds, so the
+/// dashboard must never run these separately: the old code ran a dozen of them
+/// one after another and took minutes to open on a 3.5M-file drive.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FileTotals {
+    pub total_bytes: i64,
+    pub file_count: i64,
+    pub forgotten_count: i64,
+    pub forgotten_bytes: i64,
+    pub unused_year_bytes: i64,
+    pub unanalyzed_count: i64,
+    pub missing_count: i64,
+    pub sensitive_count: i64,
+    /// Counted on `dirs`, not `files`, but it is cached with everything else so
+    /// a dashboard load never scans the 700k-row directory table either.
+    pub empty_folder_count: i64,
+    pub by_category: Vec<CategoryStat>,
+    pub by_root: Vec<RootTotals>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RootTotals {
+    pub root_id: i64,
+    pub file_count: i64,
+    pub total_bytes: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedTotals {
+    at: i64,
+    totals: FileTotals,
+}
+
+const TOTALS_KEY: &str = "cache.file_totals.v1";
+/// Backstop only. Every mutation of the index clears the cache, so the numbers
+/// are recomputed after a scan, a cleanup, an analysis or a rule run. The limit
+/// exists only so that a missed invalidation cannot be wrong for ever; it is
+/// deliberately long because expiring it forces a full index scan.
+const TOTALS_TTL_SECS: i64 = 30 * 86_400;
+
+/// Drop the cached aggregates. Call this from anything that inserts, updates or
+/// deletes rows in `files` or `dirs`.
+pub fn invalidate_totals(conn: &Connection) {
+    let _ = conn.execute("DELETE FROM settings WHERE key = ?1", [TOTALS_KEY]);
+}
+
+/// Cached entry point used by the UI. A cold call scans the index once; after
+/// that it is a single row read until something changes the index.
+pub fn file_totals(conn: &Connection) -> AppResult<FileTotals> {
+    if let Some(raw) = db::get_setting(conn, TOTALS_KEY)? {
+        if let Ok(cached) = serde_json::from_str::<CachedTotals>(&raw) {
+            if fsutil::now_secs() - cached.at <= TOTALS_TTL_SECS {
+                return Ok(cached.totals);
+            }
+        }
+    }
+    let totals = compute_file_totals(conn)?;
+    let entry = CachedTotals {
+        at: fsutil::now_secs(),
+        totals: totals.clone(),
+    };
+    if let Ok(raw) = serde_json::to_string(&entry) {
+        let _ = db::set_setting(conn, TOTALS_KEY, &raw);
+    }
+    Ok(totals)
+}
+
+/// The single pass. `NOT INDEXED` is deliberate: letting SQLite drive this from
+/// `idx_files_category` makes it fetch every row from the table by rowid, which
+/// took 75 seconds on a 3.2 GB index. A plain table scan takes about six.
+///
+/// `atime <= ? AND mtime <= ?` is the same test as `MAX(atime, mtime) <= ?`
+/// but, unlike `MAX`, it can use an index.
+fn compute_file_totals(conn: &Connection) -> AppResult<FileTotals> {
+    let forgotten_cutoff = fsutil::now_secs() - 180 * 86_400;
+    let year_cutoff = fsutil::now_secs() - 365 * 86_400;
     let mut stmt = conn.prepare(
-        "SELECT category, COALESCE(sum(size),0), count(*) FROM files GROUP BY category ORDER BY 2 DESC",
+        "SELECT root_id, category,
+                COALESCE(sum(size), 0),
+                count(*),
+                COALESCE(sum(CASE WHEN atime <= ?1 AND mtime <= ?1 THEN 1 ELSE 0 END), 0),
+                COALESCE(sum(CASE WHEN atime <= ?1 AND mtime <= ?1 THEN size ELSE 0 END), 0),
+                COALESCE(sum(CASE WHEN atime <= ?2 AND mtime <= ?2 THEN size ELSE 0 END), 0),
+                COALESCE(sum(CASE WHEN content_status = 'none' THEN 1 ELSE 0 END), 0),
+                COALESCE(sum(CASE WHEN content_status = 'missing' THEN 1 ELSE 0 END), 0),
+                COALESCE(sum(CASE WHEN sensitive = 1 THEN 1 ELSE 0 END), 0)
+         FROM files NOT INDEXED
+         GROUP BY root_id, category",
     )?;
-    let rows = stmt.query_map([], |r| {
-        Ok(CategoryStat {
-            category: r.get(0)?,
-            bytes: r.get(1)?,
-            count: r.get(2)?,
-        })
+    let rows = stmt.query_map(rusqlite::params![forgotten_cutoff, year_cutoff], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, i64>(4)?,
+            r.get::<_, i64>(5)?,
+            r.get::<_, i64>(6)?,
+            r.get::<_, i64>(7)?,
+            r.get::<_, i64>(8)?,
+            r.get::<_, i64>(9)?,
+        ))
     })?;
-    Ok(rows.filter_map(Result::ok).collect())
+
+    let mut totals = FileTotals::default();
+    for row in rows {
+        let (
+            root_id,
+            category,
+            bytes,
+            count,
+            forgotten,
+            forgotten_bytes,
+            unused_year,
+            unanalyzed,
+            missing,
+            sensitive,
+        ) = row?;
+        totals.total_bytes += bytes;
+        totals.file_count += count;
+        totals.forgotten_count += forgotten;
+        totals.forgotten_bytes += forgotten_bytes;
+        totals.unused_year_bytes += unused_year;
+        totals.unanalyzed_count += unanalyzed;
+        totals.missing_count += missing;
+        totals.sensitive_count += sensitive;
+
+        match totals
+            .by_category
+            .iter_mut()
+            .find(|c| c.category == category)
+        {
+            Some(existing) => {
+                existing.bytes += bytes;
+                existing.count += count;
+            }
+            None => totals.by_category.push(CategoryStat {
+                category,
+                bytes,
+                count,
+            }),
+        }
+        match totals.by_root.iter_mut().find(|r| r.root_id == root_id) {
+            Some(existing) => {
+                existing.total_bytes += bytes;
+                existing.file_count += count;
+            }
+            None => totals.by_root.push(RootTotals {
+                root_id,
+                file_count: count,
+                total_bytes: bytes,
+            }),
+        }
+    }
+    totals.by_category.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    // `dirs` is much smaller than `files`, but a cold read of it still costs
+    // seconds on a 3 GB index, so count the empty folders in the same cached
+    // payload rather than on every dashboard visit.
+    totals.empty_folder_count = conn.query_row(
+        "SELECT count(*) FROM dirs WHERE file_count=0 AND depth>0",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(totals)
+}
+
+/// Roots with their file counts and sizes taken from the cached totals, so this
+/// costs nothing on the UI thread even with millions of indexed files.
+pub fn roots_with_totals(conn: &Connection) -> AppResult<Vec<RootInfo>> {
+    let totals = file_totals(conn)?;
+    let mut roots = repo::list_roots_basic(conn)?;
+    for root in &mut roots {
+        if let Some(entry) = totals.by_root.iter().find(|r| r.root_id == root.id) {
+            root.file_count = entry.file_count;
+            root.total_bytes = entry.total_bytes;
+        }
+    }
+    Ok(roots)
+}
+
+pub fn category_breakdown(conn: &Connection) -> AppResult<Vec<CategoryStat>> {
+    Ok(file_totals(conn)?.by_category)
 }
 
 pub fn largest_files(conn: &Connection, limit: i64) -> AppResult<Vec<FileEntry>> {
@@ -79,7 +252,7 @@ pub fn forgotten_files(
         .join(", ");
     let mut stmt = conn.prepare(&format!(
         "SELECT {columns} FROM files f
-         WHERE MAX(f.atime, f.mtime) <= ?1 AND f.size >= ?2
+         WHERE f.atime <= ?1 AND f.mtime <= ?1 AND f.size >= ?2
          ORDER BY f.size DESC LIMIT ?3"
     ))?;
     let rows = stmt.query_map(
@@ -169,22 +342,22 @@ pub fn available_space_for(roots: &[RootInfo], disks: &[DiskInfo]) -> i64 {
 }
 
 pub fn take_snapshot(conn: &Connection) -> AppResult<Snapshot> {
-    let cats = category_breakdown(conn)?;
-    let (total, count): (i64, i64) = conn.query_row(
-        "SELECT COALESCE(sum(size),0), count(*) FROM files",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    let totals = file_totals(conn)?;
     let taken_at = fsutil::now_secs();
     conn.execute(
         "INSERT INTO storage_snapshots(taken_at, total_bytes, file_count, by_category) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![taken_at, total, count, serde_json::to_string(&cats).unwrap_or_else(|_| "[]".into())],
+        rusqlite::params![
+            taken_at,
+            totals.total_bytes,
+            totals.file_count,
+            serde_json::to_string(&totals.by_category).unwrap_or_else(|_| "[]".into())
+        ],
     )?;
     Ok(Snapshot {
         taken_at,
-        total_bytes: total,
-        file_count: count,
-        by_category: cats,
+        total_bytes: totals.total_bytes,
+        file_count: totals.file_count,
+        by_category: totals.by_category,
     })
 }
 
@@ -262,7 +435,12 @@ pub fn prediction(conn: &Connection, available: i64) -> AppResult<Option<Predict
 }
 
 pub fn clutter_score(conn: &Connection) -> AppResult<ClutterScore> {
-    let total: i64 = conn.query_row("SELECT COALESCE(sum(size),0) FROM files", [], |r| r.get(0))?;
+    let totals = file_totals(conn)?;
+    clutter_score_from(conn, &totals)
+}
+
+fn clutter_score_from(conn: &Connection, totals: &FileTotals) -> AppResult<ClutterScore> {
+    let total = totals.total_bytes;
     if total == 0 {
         return Ok(ClutterScore {
             score: 0,
@@ -274,33 +452,21 @@ pub fn clutter_score(conn: &Connection) -> AppResult<ClutterScore> {
             }],
         });
     }
-    let unused: i64 = conn.query_row(
-        "SELECT COALESCE(sum(size),0) FROM files WHERE MAX(atime,mtime) <= ?1",
-        [fsutil::now_secs() - 365 * 86_400],
-        |r| r.get(0),
-    )?;
-    let installers: i64 = conn.query_row(
-        "SELECT COALESCE(sum(size),0) FROM files WHERE category='installers'",
-        [],
-        |r| r.get(0),
-    )?;
-    let archives: i64 = conn.query_row(
-        "SELECT COALESCE(sum(size),0) FROM files WHERE category='archives'",
-        [],
-        |r| r.get(0),
-    )?;
+    let category_bytes = |name: &str| {
+        totals
+            .by_category
+            .iter()
+            .find(|c| c.category == name)
+            .map(|c| c.bytes)
+            .unwrap_or(0)
+    };
+    let unused = totals.unused_year_bytes;
+    let installers = category_bytes("installers");
+    let archives = category_bytes("archives");
     let (dup_bytes, _) = duplicate_summary(conn)?;
-    let empty: i64 = conn.query_row(
-        "SELECT count(*) FROM dirs WHERE file_count=0 AND depth>0",
-        [],
-        |r| r.get(0),
-    )?;
-    let unanalyzed: i64 = conn.query_row(
-        "SELECT count(*) FROM files WHERE content_status='none'",
-        [],
-        |r| r.get(0),
-    )?;
-    let count: i64 = conn.query_row("SELECT count(*) FROM files", [], |r| r.get(0))?;
+    let empty = totals.empty_folder_count;
+    let unanalyzed = totals.unanalyzed_count;
+    let count = totals.file_count;
 
     let pct = |v: i64| (v as f64 / total as f64 * 100.0).clamp(0.0, 100.0);
     let factors = vec![
@@ -351,10 +517,13 @@ pub fn clutter_score(conn: &Connection) -> AppResult<ClutterScore> {
 }
 
 pub fn dashboard(conn: &Connection) -> AppResult<Dashboard> {
-    let roots = repo::list_roots(conn)?;
-    let by_category = category_breakdown(conn)?;
-    let total_bytes: i64 = by_category.iter().map(|c| c.bytes).sum();
-    let file_count: i64 = by_category.iter().map(|c| c.count).sum();
+    // One pass over the files table, cached until the index changes. Every
+    // number below that used to come from its own full scan now comes from it.
+    let totals = file_totals(conn)?;
+    let roots = roots_with_totals(conn)?;
+    let by_category = totals.by_category.clone();
+    let total_bytes = totals.total_bytes;
+    let file_count = totals.file_count;
     let largest = largest_folders(conn, 8)?;
     let (duplicate_bytes, duplicate_groups) = duplicate_summary(conn)?;
     let quarantine_count: i64 = conn.query_row(
@@ -367,47 +536,24 @@ pub fn dashboard(conn: &Connection) -> AppResult<Dashboard> {
         [],
         |r| r.get(0),
     )?;
-    let forgotten_count: i64 = conn.query_row(
-        "SELECT count(*) FROM files WHERE MAX(atime,mtime) <= ?1",
-        [fsutil::now_secs() - 180 * 86_400],
-        |r| r.get(0),
-    )?;
-    let forgotten_bytes: i64 = conn.query_row(
-        "SELECT COALESCE(sum(size),0) FROM files WHERE MAX(atime,mtime) <= ?1",
-        [fsutil::now_secs() - 180 * 86_400],
-        |r| r.get(0),
-    )?;
-    let sensitive_count: i64 =
-        conn.query_row("SELECT count(*) FROM files WHERE sensitive=1", [], |r| {
-            r.get(0)
-        })?;
-    let unanalyzed_count: i64 = conn.query_row(
-        "SELECT count(*) FROM files WHERE content_status='none'",
-        [],
-        |r| r.get(0),
-    )?;
-    let empty_folder_count: i64 = conn.query_row(
-        "SELECT count(*) FROM dirs WHERE file_count=0 AND depth>0",
-        [],
-        |r| r.get(0),
-    )?;
+    let forgotten_count = totals.forgotten_count;
+    let forgotten_bytes = totals.forgotten_bytes;
+    let sensitive_count = totals.sensitive_count;
+    let unanalyzed_count = totals.unanalyzed_count;
+    let empty_folder_count = totals.empty_folder_count;
     let reminders_due: i64 = conn.query_row(
         "SELECT count(*) FROM reminders WHERE dismissed=0 AND due_date <= date('now','+60 day')",
         [],
         |r| r.get(0),
     )?;
-    let missing: i64 = conn.query_row(
-        "SELECT count(*) FROM files WHERE content_status='missing'",
-        [],
-        |r| r.get(0),
-    )?;
+    let missing = totals.missing_count;
     let disks = disks();
     let available = available_space_for(&roots, &disks);
     let last_scan_at: Option<i64> = conn
         .query_row("SELECT MAX(last_scan_at) FROM roots", [], |r| r.get(0))
         .ok()
         .flatten();
-    let clutter = clutter_score(conn)?;
+    let clutter = clutter_score_from(conn, &totals)?;
     let recent_activity = repo::recent_operations(conn, 6)?;
 
     Ok(Dashboard {
@@ -464,7 +610,7 @@ pub fn cleanup_suggestions(conn: &Connection) -> AppResult<Vec<CleanupSuggestion
 
     let archives = files_where(
         conn,
-        "category='archives' AND MAX(atime,mtime) <= ?1",
+        "category='archives' AND atime <= ?1 AND mtime <= ?1",
         &[fsutil::now_secs() - 365 * 86_400],
         60,
     )?;
@@ -485,7 +631,7 @@ pub fn cleanup_suggestions(conn: &Connection) -> AppResult<Vec<CleanupSuggestion
 
     let large_old = files_where(
         conn,
-        "size >= ?1 AND MAX(atime,mtime) <= ?2",
+        "size >= ?1 AND atime <= ?2 AND mtime <= ?2",
         &[1024 * 1024 * 1024, fsutil::now_secs() - 730 * 86_400],
         40,
     )?;
@@ -624,5 +770,59 @@ mod tests {
         seed(&conn);
         let score = clutter_score(&conn).unwrap();
         assert!((0..=100).contains(&score.score));
+    }
+
+    #[test]
+    fn totals_are_cached_and_refresh_when_invalidated() {
+        let conn = db::open_in_memory().unwrap();
+        seed(&conn);
+        let first = file_totals(&conn).unwrap();
+        assert_eq!(first.file_count, 2);
+        assert_eq!(first.total_bytes, 1500);
+
+        // A new row is invisible while the cache is warm: that is the whole
+        // point — the dashboard must not rescan millions of rows on every visit.
+        conn.execute(
+            "INSERT INTO files(id,root_id,path,parent_path,name,size,category,indexed_at,last_seen_at)
+             VALUES (3,1,'C:/lib/c.mp4','C:/lib','c.mp4',250,'video',0,0)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(file_totals(&conn).unwrap().file_count, 2);
+
+        // An empty folder added while the cache is warm is also invisible.
+        conn.execute(
+            "INSERT INTO dirs(root_id,path,parent_path,depth,file_count,total_bytes)
+             VALUES (1,'C:/lib/empty','C:/lib',1,0,0)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(file_totals(&conn).unwrap().empty_folder_count, 0);
+
+        // Anything that changes the index clears the cache.
+        invalidate_totals(&conn);
+        let refreshed = file_totals(&conn).unwrap();
+        assert_eq!(refreshed.file_count, 3);
+        assert_eq!(refreshed.total_bytes, 1750);
+        assert_eq!(refreshed.by_category[0].category, "video");
+        assert_eq!(refreshed.by_root[0].file_count, 3);
+        assert_eq!(refreshed.empty_folder_count, 1);
+    }
+
+    #[test]
+    fn forgotten_totals_match_the_max_test() {
+        let conn = db::open_in_memory().unwrap();
+        seed(&conn);
+        // Both seed rows have atime and mtime 0, so they count as forgotten.
+        let totals = file_totals(&conn).unwrap();
+        let expected: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM files WHERE MAX(atime, mtime) <= ?1",
+                [fsutil::now_secs() - 180 * 86_400],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(totals.forgotten_count, expected);
+        assert_eq!(totals.forgotten_bytes, 1500);
     }
 }

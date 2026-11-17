@@ -36,6 +36,26 @@ where
     .map_err(|e| AppError::Internal(format!("Background task failed: {e}")))?
 }
 
+/// Same as [`with_db`] for commands that change the index. The cached dashboard
+/// totals are dropped whether the command succeeds or fails, so a half-applied
+/// change can never leave stale numbers on screen.
+async fn with_db_write<T, F>(app: AppHandle, f: F) -> AppResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Connection, &Path) -> AppResult<T> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let mut conn = lock(&state)?;
+        let data_dir = state.data_dir.clone();
+        let result = f(&mut conn, &data_dir);
+        storage::invalidate_totals(&conn);
+        result
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Background task failed: {e}")))?
+}
+
 // ---------------------------------------------------------------------------
 // App + library roots
 // ---------------------------------------------------------------------------
@@ -49,7 +69,7 @@ pub fn app_info(state: State<'_, AppState>) -> AppResult<AppInfo> {
 #[tauri::command(async)]
 pub fn roots_list(state: State<'_, AppState>) -> AppResult<Vec<RootInfo>> {
     let conn = lock(&state)?;
-    repo::list_roots(&conn)
+    storage::roots_with_totals(&conn)
 }
 
 #[tauri::command(async)]
@@ -86,14 +106,16 @@ pub fn roots_add(
         "INSERT OR IGNORE INTO roots(path, label, kind, enabled, created_at) VALUES (?1, ?2, ?3, 1, ?4)",
         rusqlite::params![path_string, label, kind, crate::fsutil::now_secs()],
     )?;
-    repo::list_roots(&conn)
+    storage::invalidate_totals(&conn);
+    storage::roots_with_totals(&conn)
 }
 
 #[tauri::command(async)]
 pub fn roots_remove(state: State<'_, AppState>, id: i64) -> AppResult<Vec<RootInfo>> {
     let conn = lock(&state)?;
     conn.execute("DELETE FROM roots WHERE id=?1", [id])?;
-    repo::list_roots(&conn)
+    storage::invalidate_totals(&conn);
+    storage::roots_with_totals(&conn)
 }
 
 #[tauri::command(async)]
@@ -108,6 +130,7 @@ pub fn index_clear(state: State<'_, AppState>, confirmation: String) -> AppResul
     conn.execute("DELETE FROM relations", [])?;
     conn.execute("DELETE FROM reminders", [])?;
     conn.execute("DELETE FROM storage_snapshots", [])?;
+    storage::invalidate_totals(&conn);
     Ok(())
 }
 
@@ -259,6 +282,14 @@ pub fn scan_start(
         {
             let conn = lock(&state);
             if let Ok(conn) = conn {
+                // The walk just changed the index: drop the cached dashboard
+                // numbers, then rebuild them once (the snapshot needs them too)
+                // so the next dashboard visit is a single row read.
+                storage::invalidate_totals(&conn);
+                // Rebuild once, here, so the dashboard's automatic reload after
+                // a scan finds the numbers already computed instead of scanning
+                // millions of rows while the window waits.
+                let _ = storage::file_totals(&conn);
                 let _ = storage::record_snapshot_if_due(&conn);
                 crate::db::checkpoint(&conn);
             }
@@ -465,9 +496,14 @@ fn run_analysis(
         }
     }
 
-    if !cancelled {
+    {
         let conn = lock(state)?;
-        let _ = intelligence::rebuild_relations(&conn);
+        if !cancelled {
+            let _ = intelligence::rebuild_relations(&conn);
+        }
+        // Analysis rewrites content_status and sensitive flags, which the
+        // dashboard totals count.
+        crate::storage::invalidate_totals(&conn);
     }
 
     Ok(crate::models::AnalyzeReport {
@@ -482,6 +518,7 @@ fn run_analysis(
 pub fn analyze_file(state: State<'_, AppState>, file_id: i64) -> AppResult<AnalysisOutcome> {
     let conn = lock(&state)?;
     let outcome = intelligence::analyze_file(&conn, file_id)?;
+    storage::invalidate_totals(&conn);
     Ok(outcome)
 }
 
@@ -492,7 +529,9 @@ pub fn analyze_folder(
     limit: Option<i64>,
 ) -> AppResult<i64> {
     let conn = lock(&state)?;
-    organizer::analyze_folder(&conn, &folder, limit.unwrap_or(300))
+    let analyzed = organizer::analyze_folder(&conn, &folder, limit.unwrap_or(300))?;
+    storage::invalidate_totals(&conn);
+    Ok(analyzed)
 }
 
 // ---------------------------------------------------------------------------
@@ -541,7 +580,7 @@ pub async fn duplicates_analyze(
     mode: String,
     threshold: Option<u32>,
 ) -> AppResult<DuplicateReport> {
-    with_db(app, move |conn, _| {
+    with_db_write(app, move |conn, _| {
         duplicates::analyze(conn, &mode, threshold.unwrap_or(10))
     })
     .await
@@ -568,7 +607,7 @@ pub async fn organize_apply(
     app: AppHandle,
     items: Vec<OrganizeRequestItem>,
 ) -> AppResult<ApplyResult> {
-    with_db(app, move |conn, _| organizer::apply(conn, &items)).await
+    with_db_write(app, move |conn, _| organizer::apply(conn, &items)).await
 }
 
 #[tauri::command(async)]
@@ -590,7 +629,7 @@ pub fn rules_delete(state: State<'_, AppState>, id: String) -> AppResult<Vec<Org
 
 #[tauri::command(async)]
 pub async fn rule_run(app: AppHandle, id: String) -> AppResult<ApplyResult> {
-    with_db(app, move |conn, _| {
+    with_db_write(app, move |conn, _| {
         let rule = organizer::rules(conn)?.into_iter().find(|r| r.id == id);
         match rule {
             Some(rule) => organizer::run_rule(conn, &rule),
@@ -678,7 +717,7 @@ pub fn timeline(
 
 #[tauri::command(async)]
 pub async fn quarantine_files(app: AppHandle, file_ids: Vec<i64>) -> AppResult<QuarantineResult> {
-    with_db(app, move |conn, data_dir| {
+    with_db_write(app, move |conn, data_dir| {
         cleanup::quarantine(conn, data_dir, &file_ids)
     })
     .await
@@ -690,7 +729,7 @@ pub async fn quarantine_paths(
     paths: Vec<String>,
     label: Option<String>,
 ) -> AppResult<QuarantineResult> {
-    with_db(app, move |conn, data_dir| {
+    with_db_write(app, move |conn, data_dir| {
         cleanup::quarantine_paths(
             conn,
             data_dir,
@@ -712,7 +751,7 @@ pub fn quarantine_list(
 
 #[tauri::command(async)]
 pub async fn quarantine_restore(app: AppHandle, ids: Vec<String>) -> AppResult<QuarantineResult> {
-    with_db(app, move |conn, _| cleanup::restore(conn, &ids)).await
+    with_db_write(app, move |conn, _| cleanup::restore(conn, &ids)).await
 }
 
 #[tauri::command(async)]
@@ -721,7 +760,7 @@ pub async fn quarantine_permanent_delete(
     ids: Vec<String>,
     confirmation: String,
 ) -> AppResult<QuarantineResult> {
-    with_db(app, move |conn, data_dir| {
+    with_db_write(app, move |conn, data_dir| {
         cleanup::permanent_delete(conn, data_dir, &ids, &confirmation)
     })
     .await
@@ -729,7 +768,7 @@ pub async fn quarantine_permanent_delete(
 
 #[tauri::command(async)]
 pub async fn quarantine_purge(app: AppHandle) -> AppResult<i64> {
-    with_db(app, move |conn, data_dir| {
+    with_db_write(app, move |conn, data_dir| {
         cleanup::purge_quarantine(conn, data_dir)
     })
     .await
@@ -746,7 +785,7 @@ pub fn operations_list(
 
 #[tauri::command(async)]
 pub async fn operation_undo(app: AppHandle, id: String) -> AppResult<OperationEntry> {
-    with_db(app, move |conn, data_dir| {
+    with_db_write(app, move |conn, data_dir| {
         cleanup::undo_operation(conn, &id, data_dir)
     })
     .await
@@ -754,7 +793,7 @@ pub async fn operation_undo(app: AppHandle, id: String) -> AppResult<OperationEn
 
 #[tauri::command(async)]
 pub async fn empty_folders_remove(app: AppHandle, folders: Vec<String>) -> AppResult<i64> {
-    with_db(app, move |conn, _| {
+    with_db_write(app, move |conn, _| {
         cleanup::remove_empty_folders(conn, &folders)
     })
     .await
@@ -838,7 +877,7 @@ pub async fn automation_run(
     id: String,
     apply_now: Option<bool>,
 ) -> AppResult<AutomationRun> {
-    with_db(app, move |conn, _| {
+    with_db_write(app, move |conn, _| {
         automation::run(conn, &id, apply_now.unwrap_or(false))
     })
     .await

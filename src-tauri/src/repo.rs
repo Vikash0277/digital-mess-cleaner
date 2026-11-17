@@ -74,11 +74,12 @@ pub fn load_files_at_paths(conn: &Connection, paths: &[String]) -> AppResult<Vec
     Ok(rows.filter_map(Result::ok).collect())
 }
 
-pub fn list_roots(conn: &Connection) -> AppResult<Vec<RootInfo>> {
+/// Roots without touching the files table. Counts and sizes are left at zero
+/// because a per-root `sum(size)` over millions of rows is a full index walk;
+/// `storage::roots_with_totals` fills them from the cached totals instead.
+pub fn list_roots_basic(conn: &Connection) -> AppResult<Vec<RootInfo>> {
     let mut stmt = conn.prepare(
-        "SELECT r.id, r.path, r.label, r.kind, r.enabled, r.last_scan_at,
-                COALESCE((SELECT count(*) FROM files f WHERE f.root_id = r.id), 0),
-                COALESCE((SELECT sum(size) FROM files f WHERE f.root_id = r.id), 0)
+        "SELECT r.id, r.path, r.label, r.kind, r.enabled, r.last_scan_at
          FROM roots r ORDER BY r.created_at ASC",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -89,8 +90,8 @@ pub fn list_roots(conn: &Connection) -> AppResult<Vec<RootInfo>> {
             kind: row.get(3)?,
             enabled: row.get::<_, i64>(4)? != 0,
             last_scan_at: row.get(5)?,
-            file_count: row.get(6)?,
-            total_bytes: row.get(7)?,
+            file_count: 0,
+            total_bytes: 0,
         })
     })?;
     Ok(rows.filter_map(Result::ok).collect())
