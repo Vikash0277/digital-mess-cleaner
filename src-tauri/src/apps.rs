@@ -109,38 +109,21 @@ fn normalize_location(raw: &str) -> String {
     value
 }
 
-/// Escape the three characters that are special to SQLite LIKE. The escape
-/// character itself is backslash, so a literal backslash must be doubled.
-fn like_escape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if matches!(ch, '\\' | '%' | '_') {
-            out.push('\\');
-        }
-        out.push(ch);
-    }
-    out
-}
-
-/// Sum the indexed files under an install folder. Uses the unique index on
-/// `files.path`, so a prefix LIKE stays fast even on a multi-million-row index.
+/// Sum the indexed files under an install folder. A `LIKE` prefix with a bound
+/// parameter scans the whole table on SQLite; an explicit range uses the unique
+/// index on `files.path` and stays fast on a multi-million-row index.
 fn indexed_size(conn: &Connection, location: &str, separator: char) -> AppResult<(i64, i64)> {
     let normalized = normalize_location(location);
     if normalized.is_empty() {
         return Ok((0, 0));
     }
-    let mut pattern = like_escape(&normalized);
-    if separator == '\\' {
-        pattern.push('\\');
-        pattern.push('\\');
-    } else {
-        pattern.push(separator);
-    }
-    pattern.push('%');
+    let mut prefix = normalized;
+    prefix.push(separator);
+    let high = format!("{prefix}\u{10ffff}");
 
     let (bytes, count): (i64, i64) = conn.query_row(
-        r"SELECT COALESCE(SUM(size),0), COUNT(*) FROM files WHERE path LIKE ?1 ESCAPE '\'",
-        rusqlite::params![pattern],
+        "SELECT COALESCE(SUM(size),0), COUNT(*) FROM files WHERE path >= ?1 AND path < ?2",
+        rusqlite::params![prefix, high],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     Ok((bytes, count))
@@ -379,12 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn escapes_like_special_characters() {
-        assert_eq!(like_escape(r"C:\100%_apps"), r"C:\\100\%\_apps");
-    }
-
-    #[test]
-    fn indexed_size_uses_a_prefix_and_does_not_leak_to_sibling_folders() {
+    fn indexed_size_uses_an_indexed_range_and_does_not_leak_to_sibling_folders() {
         let conn = crate::db::open_in_memory().unwrap();
         conn.execute(
             "INSERT INTO roots(id,path,label,kind,created_at) VALUES (1,'C:\\apps','apps','folder',0)",
