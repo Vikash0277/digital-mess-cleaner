@@ -5,8 +5,8 @@ use crate::error::{AppError, AppResult};
 use crate::intelligence::AnalysisOutcome;
 use crate::models::*;
 use crate::{
-    apps, automation, cleanup, duplicates, health, intelligence, media, organizer, repo, scanner,
-    search, storage, AppState,
+    apps, automation, cleanup, duplicates, fileviewer, health, intelligence, media, organizer,
+    repo, scanner, search, storage, AppState,
 };
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -237,6 +237,32 @@ pub async fn installed_apps(state: State<'_, AppState>) -> AppResult<InstalledAp
     tauri::async_runtime::spawn_blocking(move || apps::installed_apps(&db_path))
         .await
         .map_err(|e| AppError::Internal(format!("Background task failed: {e}")))?
+}
+
+// ---------------------------------------------------------------------------
+// Read-only file viewing
+// ---------------------------------------------------------------------------
+
+/// All four commands validate the indexed id and path in Rust. They never write
+/// to the operation log: opening or inspecting a file is not a file operation.
+#[tauri::command]
+pub async fn file_open(app: AppHandle, file_id: i64) -> AppResult<()> {
+    with_db(app, move |conn, _| fileviewer::open_file(conn, file_id)).await
+}
+
+#[tauri::command]
+pub async fn file_reveal(app: AppHandle, file_id: i64) -> AppResult<()> {
+    with_db(app, move |conn, _| fileviewer::reveal_file(conn, file_id)).await
+}
+
+#[tauri::command]
+pub async fn file_details(app: AppHandle, file_id: i64) -> AppResult<FileDetails> {
+    with_db(app, move |conn, _| fileviewer::file_details(conn, file_id)).await
+}
+
+#[tauri::command]
+pub async fn file_preview(app: AppHandle, file_id: i64) -> AppResult<FilePreview> {
+    with_db(app, move |conn, _| fileviewer::file_preview(conn, file_id)).await
 }
 
 // ---------------------------------------------------------------------------

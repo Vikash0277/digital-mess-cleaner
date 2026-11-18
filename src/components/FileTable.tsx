@@ -3,6 +3,7 @@ import { File, FileArchive, FileAudio, FileImage, FileText, FileVideo, Package }
 import { useEffect, useRef, type ReactNode } from "react";
 import { categoryLabel, formatBytes, formatDate } from "../lib/format";
 import type { FileEntry } from "../lib/types";
+import { FileActions } from "./FileActions";
 
 const ICONS = {
   documents: FileText,
@@ -32,6 +33,8 @@ export interface FileTableProps {
   empty?: ReactNode;
   /** Categories are hidden on the duplicates screen, where grouping carries it. */
   showCategory?: boolean;
+  /** Read-only open/reveal/preview/details actions. On by default everywhere. */
+  showActions?: boolean;
 }
 
 export function FileTable({
@@ -42,6 +45,7 @@ export function FileTable({
   caption = "Files",
   empty,
   showCategory = true,
+  showActions = true,
 }: FileTableProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const selectable = Boolean(selected && onToggle);
@@ -104,6 +108,11 @@ export function FileTable({
             Category
           </span>
         )}
+        {showActions && (
+          <span role="columnheader" className="file-table-actions">
+            Actions
+          </span>
+        )}
       </div>
 
       <div ref={scrollRef} className="file-table-body" aria-label={`${caption} list`}>
@@ -159,6 +168,11 @@ export function FileTable({
                 {showCategory && (
                   <span className="file-table-category" role="gridcell">
                     <span className="badge">{categoryLabel(file.category)}</span>
+                  </span>
+                )}
+                {showActions && (
+                  <span className="file-table-actions" role="gridcell">
+                    <FileActions file={file} />
                   </span>
                 )}
               </div>

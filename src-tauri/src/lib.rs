@@ -7,6 +7,7 @@ pub mod commands;
 pub mod db;
 pub mod duplicates;
 pub mod error;
+pub mod fileviewer;
 pub mod format;
 pub mod fsutil;
 pub mod health;
@@ -127,6 +128,10 @@ pub fn run() {
             commands::storage_growth,
             commands::storage_category_details,
             commands::installed_apps,
+            commands::file_open,
+            commands::file_reveal,
+            commands::file_details,
+            commands::file_preview,
             commands::scan_start,
             commands::scan_cancel,
             commands::analyze_start,

@@ -40,6 +40,34 @@ pub struct FileEntry {
     pub snippet: Option<String>,
 }
 
+/// What the app itself knows about a file, plus a safe check of what is on disk
+/// right now. Never opens or changes file contents.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileDetails {
+    pub file: FileEntry,
+    pub exists: bool,
+    pub current_size: i64,
+    pub current_mtime: i64,
+    pub root_label: String,
+    pub root_path: String,
+}
+
+/// A bounded, read-only preview. Binary data is base64 so the webview never
+/// receives a filesystem path or a broad filesystem scope.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilePreview {
+    /// text | image | pdf | unsupported | too_large
+    pub kind: String,
+    pub mime: String,
+    pub text: Option<String>,
+    pub data: Option<String>,
+    pub reason: String,
+    pub truncated: bool,
+    pub limit_bytes: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RootInfo {

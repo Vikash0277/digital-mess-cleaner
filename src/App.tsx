@@ -38,6 +38,7 @@ import { Sidebar, type NavGroup } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
 import { DashboardPage } from "./pages/DashboardPage";
 import { SmartSearchPage } from "./pages/SmartSearchPage";
+import { FileInspectorProvider } from "./components/FileInspector";
 import { MyFilesPage } from "./pages/MyFilesPage";
 import { DuplicatesPage } from "./pages/DuplicatesPage";
 import { MediaCleanupPage } from "./pages/MediaCleanupPage";
@@ -234,7 +235,9 @@ export function App() {
       <Router>
         <ReviewProvider>
           <ScanProvider>
-            <Shell />
+            <FileInspectorProvider>
+              <Shell />
+            </FileInspectorProvider>
           </ScanProvider>
         </ReviewProvider>
       </Router>

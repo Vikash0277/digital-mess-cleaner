@@ -10,7 +10,9 @@ import type {
   CleanupSuggestion,
   Dashboard,
   DuplicateReport,
+  FileDetails,
   FileEntry,
+  FilePreview,
   FolderStat,
   InstalledApps,
   MediaOverview,
@@ -98,6 +100,10 @@ export const api = {
       limit: limit ?? null,
     }),
   installedApps: () => call<InstalledApps>("installed_apps"),
+  openFile: (fileId: number) => call<void>("file_open", { fileId }),
+  revealFile: (fileId: number) => call<void>("file_reveal", { fileId }),
+  fileDetails: (fileId: number) => call<FileDetails>("file_details", { fileId }),
+  filePreview: (fileId: number) => call<FilePreview>("file_preview", { fileId }),
   forgottenFiles: (days?: number, minSize?: number, limit?: number) =>
     call<FileEntry[]>("storage_forgotten", {
       days: days ?? null,

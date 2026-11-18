@@ -1,6 +1,7 @@
 import { Repeat, ShieldCheck } from "lucide-react";
 import { useMemo, useState } from "react";
 import { EmptyState } from "../components/EmptyState";
+import { FileActions } from "../components/FileActions";
 import { ErrorNotice, LoadingNotice, SuccessNotice } from "../components/Notice";
 import { ProgressBar } from "../components/ProgressBar";
 import { api, errorMessage } from "../lib/api";
@@ -295,17 +296,19 @@ export function DuplicatesPage() {
                 {group.files.map((file) => {
                   const isSelected = selected.has(file.id);
                   return (
-                    <label
+                    <div
                       key={file.id}
                       className="group-file-row"
                       data-selected={isSelected || undefined}
                     >
-                      <input
-                        type="checkbox"
-                        checked={isSelected}
-                        onChange={() => toggle(file.id)}
-                        aria-label={`Select ${file.name}`}
-                      />
+                      <label className="group-file-check">
+                        <input
+                          type="checkbox"
+                          checked={isSelected}
+                          onChange={() => toggle(file.id)}
+                          aria-label={`Select ${file.name}`}
+                        />
+                      </label>
                       <span className="group-file-name" title={file.path}>
                         {file.name}
                       </span>
@@ -314,7 +317,10 @@ export function DuplicatesPage() {
                       </span>
                       <span className="group-file-size">{formatBytes(file.size)}</span>
                       <span className="group-file-date">{formatDate(file.mtime)}</span>
-                    </label>
+                      <span className="group-file-actions">
+                        <FileActions file={file} />
+                      </span>
+                    </div>
                   );
                 })}
               </div>

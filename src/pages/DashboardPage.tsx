@@ -2,6 +2,7 @@ import { FolderPlus, Search, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
 import { EmptyState } from "../components/EmptyState";
+import { FileActions } from "../components/FileActions";
 import { FileTable } from "../components/FileTable";
 import { ErrorNotice, LoadingNotice, SuccessNotice } from "../components/Notice";
 import { ScanControls } from "../components/ScanControls";
@@ -277,6 +278,9 @@ export function DashboardPage() {
                         </span>
                         <span>{formatBytes(hit.file.size)}</span>
                         <span>{formatDate(hit.file.mtime)}</span>
+                        <span className="category-summary-actions">
+                          <FileActions file={hit.file} />
+                        </span>
                       </li>
                     ))}
                   </ul>

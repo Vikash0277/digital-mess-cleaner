@@ -49,6 +49,25 @@ export interface FileEntry {
   snippet: string | null;
 }
 
+export interface FileDetails {
+  file: FileEntry;
+  exists: boolean;
+  currentSize: number;
+  currentMtime: number;
+  rootLabel: string;
+  rootPath: string;
+}
+
+export interface FilePreview {
+  kind: "text" | "image" | "pdf" | "unsupported" | "too_large";
+  mime: string;
+  text: string | null;
+  data: string | null;
+  reason: string;
+  truncated: boolean;
+  limitBytes: number;
+}
+
 export interface CategoryStat {
   category: string;
   bytes: number;
