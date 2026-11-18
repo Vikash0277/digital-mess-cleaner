@@ -6,11 +6,13 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type {
   AppInfo,
   AskAnswer,
+  CategoryDetails,
   CleanupSuggestion,
   Dashboard,
   DuplicateReport,
   FileEntry,
   FolderStat,
+  InstalledApps,
   MediaOverview,
   OperationEntry,
   Page,
@@ -90,6 +92,12 @@ export const api = {
     call<FileEntry[]>("storage_largest_files", { limit: limit ?? null }),
   largestFolders: (limit?: number) =>
     call<FolderStat[]>("storage_largest_folders", { limit: limit ?? null }),
+  categoryDetails: (category: string, limit?: number) =>
+    call<CategoryDetails>("storage_category_details", {
+      category,
+      limit: limit ?? null,
+    }),
+  installedApps: () => call<InstalledApps>("installed_apps"),
   forgottenFiles: (days?: number, minSize?: number, limit?: number) =>
     call<FileEntry[]>("storage_forgotten", {
       days: days ?? null,

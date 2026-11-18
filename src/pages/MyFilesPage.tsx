@@ -1,5 +1,6 @@
 import { Search, ShieldCheck } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { EmptyState } from "../components/EmptyState";
 import { FileTable } from "../components/FileTable";
 import { ErrorNotice, LoadingNotice, NoResults, SuccessNotice } from "../components/Notice";
@@ -31,7 +32,8 @@ interface BrowseResult {
 
 export function MyFilesPage() {
   const review = useReview();
-  const [query, setQuery] = useState("");
+  const [searchParams] = useSearchParams();
+  const [query, setQuery] = useState(() => searchParams.get("q") ?? "");
   const debouncedQuery = useDebouncedValue(query, 300);
   const [category, setCategory] = useState("");
   const [sort, setSort] = useState("mtime_desc");

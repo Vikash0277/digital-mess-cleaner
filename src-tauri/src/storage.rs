@@ -195,6 +195,83 @@ pub fn category_breakdown(conn: &Connection) -> AppResult<Vec<CategoryStat>> {
     Ok(file_totals(conn)?.by_category)
 }
 
+/// Break one category down into extensions, folders and its largest files.
+/// Called only when a user opens a category on the dashboard, so it can afford
+/// the full-table groupings that the dashboard itself deliberately avoids.
+pub fn category_details(
+    conn: &Connection,
+    category: &str,
+    limit: i64,
+) -> AppResult<CategoryDetails> {
+    let limit = limit.clamp(1, 100);
+    let (total_bytes, file_count): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(size),0), COUNT(*) FROM files WHERE category = ?1",
+        [category],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+
+    let mut by_extension = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT LOWER(ext) AS ext, COUNT(*) AS n, COALESCE(SUM(size),0) AS bytes
+             FROM files WHERE category = ?1
+             GROUP BY LOWER(ext) ORDER BY bytes DESC, n DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![category, limit], |r| {
+            Ok(ExtensionStat {
+                ext: r.get(0)?,
+                count: r.get(1)?,
+                bytes: r.get(2)?,
+            })
+        })?;
+        for row in rows.flatten() {
+            by_extension.push(row);
+        }
+    }
+
+    let mut by_folder = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT parent_path, COUNT(*) AS n, COALESCE(SUM(size),0) AS bytes
+             FROM files WHERE category = ?1
+             GROUP BY parent_path ORDER BY bytes DESC, n DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![category, limit], |r| {
+            Ok(FolderStat {
+                path: r.get(0)?,
+                count: r.get(1)?,
+                bytes: r.get(2)?,
+            })
+        })?;
+        for row in rows.flatten() {
+            by_folder.push(row);
+        }
+    }
+
+    let columns = repo::FILE_COLUMNS
+        .split(',')
+        .map(|c| format!("f.{}", c.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let largest_files = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {columns} FROM files f WHERE f.category = ?1
+             ORDER BY f.size DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params![category, limit], repo::row_to_file)?;
+        rows.flatten().collect()
+    };
+
+    Ok(CategoryDetails {
+        category: category.to_string(),
+        total_bytes,
+        file_count,
+        by_extension,
+        by_folder,
+        largest_files,
+    })
+}
+
 pub fn largest_files(conn: &Connection, limit: i64) -> AppResult<Vec<FileEntry>> {
     let columns = repo::FILE_COLUMNS
         .split(',')
@@ -762,6 +839,30 @@ mod tests {
         let cats = category_breakdown(&conn).unwrap();
         assert_eq!(cats.len(), 2);
         assert_eq!(cats[0].bytes, 1000);
+    }
+
+    #[test]
+    fn category_details_groups_extensions_folders_and_largest_files() {
+        let conn = db::open_in_memory().unwrap();
+        seed(&conn);
+        conn.execute(
+            "INSERT INTO files(id,root_id,path,parent_path,name,ext,size,mtime,atime,category,indexed_at,last_seen_at)
+             VALUES (3,1,'C:/lib/c.dat','C:/lib','c.dat','dat',750,0,0,'other',0,0),
+                    (4,1,'C:/lib/sub/d.dat','C:/lib/sub','d.dat','dat',250,0,0,'other',0,0)",
+            [],
+        )
+        .unwrap();
+
+        let details = category_details(&conn, "other", 10).unwrap();
+        assert_eq!(details.file_count, 2);
+        assert_eq!(details.total_bytes, 1000);
+        assert_eq!(details.by_extension.len(), 1);
+        assert_eq!(details.by_extension[0].ext, "dat");
+        assert_eq!(details.by_extension[0].count, 2);
+        assert_eq!(details.by_folder.len(), 2);
+        assert_eq!(details.by_folder[0].path, "C:/lib");
+        assert_eq!(details.largest_files.len(), 2);
+        assert_eq!(details.largest_files[0].size, 750);
     }
 
     #[test]

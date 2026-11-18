@@ -833,7 +833,7 @@ dependencies = [
 
 [[package]]
 name = "digital-mess-cleaner"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "blake3",
  "chrono",
@@ -855,6 +855,7 @@ dependencies = [
  "unicode-normalization",
  "uuid",
  "walkdir",
+ "winreg",
  "zip",
 ]
 

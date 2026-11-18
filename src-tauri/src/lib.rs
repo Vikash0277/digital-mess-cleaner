@@ -1,5 +1,6 @@
 //! Digital Mess Cleaner — app setup, shared state and command registration.
 
+pub mod apps;
 pub mod automation;
 pub mod cleanup;
 pub mod commands;
@@ -124,6 +125,8 @@ pub fn run() {
             commands::storage_trends,
             commands::storage_snapshot,
             commands::storage_growth,
+            commands::storage_category_details,
+            commands::installed_apps,
             commands::scan_start,
             commands::scan_cancel,
             commands::analyze_start,

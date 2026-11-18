@@ -63,6 +63,28 @@ pub struct CategoryStat {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ExtensionStat {
+    pub ext: String,
+    pub bytes: i64,
+    pub count: i64,
+}
+
+/// On-demand drill-down for one category in "What takes up space".
+/// Never computed on dashboard load: on a multi-million-row index the three
+/// groupings are only worth their cost once the user asks for them.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CategoryDetails {
+    pub category: String,
+    pub total_bytes: i64,
+    pub file_count: i64,
+    pub by_extension: Vec<ExtensionStat>,
+    pub by_folder: Vec<FolderStat>,
+    pub largest_files: Vec<FileEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FolderStat {
     pub path: String,
     pub bytes: i64,
@@ -78,6 +100,38 @@ pub struct DiskInfo {
     pub available: i64,
     pub kind: String,
     pub removable: bool,
+}
+
+/// One installed application. Sizes are measured from the local index when an
+/// install folder is recorded, otherwise the installer's own estimate is used
+/// and the UI says so. `evidence`/`confidence` explain the system/app split.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledApp {
+    pub name: String,
+    pub publisher: String,
+    pub version: String,
+    pub install_location: String,
+    pub bytes: i64,
+    pub file_count: i64,
+    pub system: bool,
+    pub size_source: String,
+    pub evidence: String,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledApps {
+    pub system_apps: Vec<InstalledApp>,
+    pub user_apps: Vec<InstalledApp>,
+    pub system_bytes: i64,
+    pub user_bytes: i64,
+    pub system_count: i64,
+    pub user_count: i64,
+    pub estimated_count: i64,
+    pub platform: String,
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

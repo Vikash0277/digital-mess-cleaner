@@ -5,8 +5,8 @@ use crate::error::{AppError, AppResult};
 use crate::intelligence::AnalysisOutcome;
 use crate::models::*;
 use crate::{
-    automation, cleanup, duplicates, health, intelligence, media, organizer, repo, scanner, search,
-    storage, AppState,
+    apps, automation, cleanup, duplicates, health, intelligence, media, organizer, repo, scanner,
+    search, storage, AppState,
 };
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -215,6 +215,28 @@ pub fn storage_snapshot(state: State<'_, AppState>) -> AppResult<Snapshot> {
 pub fn storage_growth(state: State<'_, AppState>, days: Option<i64>) -> AppResult<StorageGrowth> {
     let conn = lock(&state)?;
     health::storage_growth(&conn, days.unwrap_or(90))
+}
+
+/// Explicit drill-down: never part of dashboard load because it groups millions
+/// of rows. Runs off the UI thread so the app stays responsive while it works.
+#[tauri::command]
+pub async fn storage_category_details(
+    app: AppHandle,
+    category: String,
+    limit: Option<i64>,
+) -> AppResult<CategoryDetails> {
+    with_db(app, move |conn, _| {
+        storage::category_details(conn, &category, limit.unwrap_or(20))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn installed_apps(state: State<'_, AppState>) -> AppResult<InstalledApps> {
+    let db_path = state.data_dir.join("digital-mess-cleaner.db");
+    tauri::async_runtime::spawn_blocking(move || apps::installed_apps(&db_path))
+        .await
+        .map_err(|e| AppError::Internal(format!("Background task failed: {e}")))?
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,8 @@
-import { FolderPlus, Trash2 } from "lucide-react";
-import { useCallback, useState } from "react";
+import { FolderPlus, Search, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { Link } from "react-router-dom";
 import { EmptyState } from "../components/EmptyState";
+import { FileTable } from "../components/FileTable";
 import { ErrorNotice, LoadingNotice, SuccessNotice } from "../components/Notice";
 import { ScanControls } from "../components/ScanControls";
 import { StatCard } from "../components/StatCard";
@@ -10,22 +12,78 @@ import {
   categoryLabel,
   formatBytes,
   formatCount,
+  formatDate,
   formatDateTime,
   pluralize,
   relativeTime,
 } from "../lib/format";
 import { bumpData, useAsync } from "../lib/hooks";
 import { useReview } from "../lib/review";
-import type { RootInfo } from "../lib/types";
+import type { CategoryDetails, InstalledApp, RootInfo, SearchResponse } from "../lib/types";
 
 const loadDashboard = () => api.dashboard();
+const loadInstalledApps = () => api.installedApps();
+
+function AppColumn({
+  title,
+  apps,
+  empty,
+}: {
+  title: string;
+  apps: InstalledApp[];
+  empty: string;
+}) {
+  return (
+    <div>
+      <h3 className="subheading">{title}</h3>
+      {apps.length === 0 ? (
+        <p className="muted">{empty}</p>
+      ) : (
+        <ul className="app-list">
+          {apps.slice(0, 12).map((app) => (
+            <li
+              key={`${app.name}-${app.installLocation}`}
+              className="app-item"
+              title={app.installLocation || app.name}
+            >
+              <div className="app-item-head">
+                <span className="app-name">{app.name}</span>
+                <span className="app-size">{formatBytes(app.bytes)}</span>
+              </div>
+              <span className="muted app-evidence">
+                {app.evidence} ·{" "}
+                {app.sizeSource === "installer estimate" ? "estimated size" : "measured size"} ·
+                confidence {Math.round(app.confidence * 100)}%
+              </span>
+            </li>
+          ))}
+          {apps.length > 12 && (
+            <li className="muted app-evidence">…and {formatCount(apps.length - 12)} more</li>
+          )}
+        </ul>
+      )}
+    </div>
+  );
+}
 
 export function DashboardPage() {
   const dashboard = useAsync(loadDashboard);
+  const apps = useAsync(loadInstalledApps);
   const review = useReview();
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResult, setSearchResult] = useState<SearchResponse | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+
+  const [detailsCategory, setDetailsCategory] = useState<string | null>(null);
+  const [detailsRetry, setDetailsRetry] = useState(0);
+  const [details, setDetails] = useState<CategoryDetails | null>(null);
+  const [detailsLoading, setDetailsLoading] = useState(false);
+  const [detailsError, setDetailsError] = useState<string | null>(null);
 
   const addFolder = useCallback(async () => {
     setActionError(null);
@@ -75,6 +133,51 @@ export function DashboardPage() {
     },
     [review],
   );
+
+  const runSearch = useCallback(
+    async (event?: FormEvent<HTMLFormElement>) => {
+      event?.preventDefault();
+      const query = searchQuery.trim();
+      if (!query) {
+        setSearchResult(null);
+        return;
+      }
+      setSearching(true);
+      setSearchError(null);
+      try {
+        setSearchResult(await api.searchFiles(query, { limit: 8 }));
+      } catch (error) {
+        setSearchError(errorMessage(error));
+      } finally {
+        setSearching(false);
+      }
+    },
+    [searchQuery],
+  );
+
+  useEffect(() => {
+    if (!detailsCategory) {
+      setDetails(null);
+      return;
+    }
+    let cancelled = false;
+    setDetailsLoading(true);
+    setDetailsError(null);
+    api
+      .categoryDetails(detailsCategory, 12)
+      .then((value) => {
+        if (!cancelled) setDetails(value);
+      })
+      .catch((cause: unknown) => {
+        if (!cancelled) setDetailsError(errorMessage(cause));
+      })
+      .finally(() => {
+        if (!cancelled) setDetailsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [detailsCategory, detailsRetry]);
 
   const data = dashboard.data;
   const hasRoots = (data?.roots.length ?? 0) > 0;
@@ -127,6 +230,67 @@ export function DashboardPage() {
         <>
           <ScanControls hasRoots={hasRoots} onNeedFolder={() => void addFolder()} />
 
+          <section className="card dashboard-search" aria-labelledby="dashboard-search-title">
+            <div className="section-head">
+              <h2 id="dashboard-search-title" className="section-title">
+                Search your files
+              </h2>
+              <span className="muted">Looks only in the folders you chose</span>
+            </div>
+            <form
+              className="search-bar"
+              onSubmit={(event) => void runSearch(event)}
+              role="search"
+            >
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                placeholder="Search by name, folder, or text inside indexed documents…"
+                aria-label="Search your files from the Dashboard"
+              />
+              <button type="submit" className="btn btn-primary" disabled={searching}>
+                <Search size={14} aria-hidden="true" />
+                Search
+              </button>
+            </form>
+
+            {searchError && <ErrorNotice message={searchError} />}
+            {searching && <LoadingNotice label="Searching your local index…" />}
+
+            {searchResult && !searching && (
+              <div className="search-results">
+                <p className="muted">
+                  {formatCount(searchResult.total)} {pluralize(searchResult.total, "match")} ·{" "}
+                  {searchResult.tookMs} ms
+                  {searchResult.mode === "full-text" ? " · searched inside documents" : ""}
+                </p>
+                {searchResult.hits.length === 0 ? (
+                  <p className="muted">No files matched. Try a broader search.</p>
+                ) : (
+                  <ul className="category-summary-list">
+                    {searchResult.hits.map((hit) => (
+                      <li key={hit.file.id} className="category-summary-item">
+                        <span title={hit.file.path}>
+                          {hit.file.name}
+                          <span className="muted"> · {categoryLabel(hit.file.category)}</span>
+                        </span>
+                        <span>{formatBytes(hit.file.size)}</span>
+                        <span>{formatDate(hit.file.mtime)}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <Link
+                  className="btn dashboard-search-more"
+                  to={`/my-files?q=${encodeURIComponent(searchResult.query)}`}
+                >
+                  View all results in My Files
+                </Link>
+              </div>
+            )}
+          </section>
+
           <StorageBar
             byCategory={data.byCategory}
             totalBytes={data.totalBytes}
@@ -172,7 +336,7 @@ export function DashboardPage() {
           {data.roots.length === 0 ? (
             <EmptyState
               title="No folders added"
-              description="Add a folder or drive to begin scanning. Nothing is scanned until you say so."
+              description="Add a folder on the Dashboard and run a scan. Nothing is scanned until you say so."
               icon="hard-drive"
               buttonText="Add storage location"
               onAction={() => void addFolder()}
@@ -232,15 +396,31 @@ export function DashboardPage() {
 
           {data.byCategory.length > 0 && (
             <section className="card category-summary" aria-labelledby="categories-title">
-              <h2 id="categories-title" className="section-title">
-                What takes up space
-              </h2>
+              <div className="section-head">
+                <h2 id="categories-title" className="section-title">
+                  What takes up space
+                </h2>
+                <span className="muted">Select a category to see what is inside it</span>
+              </div>
               <ul className="category-summary-list">
                 {[...data.byCategory]
                   .sort((a, b) => b.bytes - a.bytes)
                   .map((entry) => (
                     <li key={entry.category} className="category-summary-item">
-                      <span>{categoryLabel(entry.category)}</span>
+                      <span>
+                        <button
+                          type="button"
+                          className="category-link"
+                          aria-expanded={detailsCategory === entry.category}
+                          onClick={() =>
+                            setDetailsCategory((current) =>
+                              current === entry.category ? null : entry.category,
+                            )
+                          }
+                        >
+                          {categoryLabel(entry.category)}
+                        </button>
+                      </span>
                       <span>{formatBytes(entry.bytes)}</span>
                       <span>{formatCount(entry.count)} files</span>
                     </li>
@@ -248,6 +428,136 @@ export function DashboardPage() {
               </ul>
             </section>
           )}
+
+          {detailsCategory && (
+            <section className="card" aria-labelledby="details-title">
+              <div className="section-head">
+                <h2 id="details-title" className="section-title">
+                  Inside {categoryLabel(detailsCategory)}
+                </h2>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => setDetailsCategory(null)}
+                >
+                  Close
+                </button>
+              </div>
+
+              {detailsLoading && <LoadingNotice label="Grouping files in this category…" />}
+              {detailsError && (
+                <ErrorNotice
+                  message={detailsError}
+                  onRetry={() => setDetailsRetry((value) => value + 1)}
+                />
+              )}
+
+              {details && !detailsLoading && (
+                <>
+                  <p className="muted">
+                    {formatBytes(details.totalBytes)} across {formatCount(details.fileCount)}{" "}
+                    {pluralize(details.fileCount, "file")}
+                  </p>
+                  <div className="details-grid">
+                    <div>
+                      <h3 className="subheading">By extension</h3>
+                      {details.byExtension.length === 0 ? (
+                        <p className="muted">No files in this category.</p>
+                      ) : (
+                        <ul className="category-summary-list">
+                          {details.byExtension.map((entry) => (
+                            <li key={entry.ext} className="category-summary-item">
+                              <span>{entry.ext ? `.${entry.ext}` : "(no extension)"}</span>
+                              <span>{formatBytes(entry.bytes)}</span>
+                              <span>{formatCount(entry.count)} files</span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                    <div>
+                      <h3 className="subheading">By folder</h3>
+                      {details.byFolder.length === 0 ? (
+                        <p className="muted">No folders in this category.</p>
+                      ) : (
+                        <ul className="category-summary-list">
+                          {details.byFolder.map((entry) => (
+                            <li key={entry.path} className="category-summary-item">
+                              <span title={entry.path}>{entry.path || "(root)"}</span>
+                              <span>{formatBytes(entry.bytes)}</span>
+                              <span>{formatCount(entry.count)} files</span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  </div>
+
+                  <h3 className="subheading">Largest files</h3>
+                  {details.largestFiles.length === 0 ? (
+                    <p className="muted">No files to show.</p>
+                  ) : (
+                    <div className="media-table">
+                      <FileTable
+                        files={details.largestFiles}
+                        caption={`Largest ${categoryLabel(detailsCategory)} files`}
+                      />
+                    </div>
+                  )}
+                </>
+              )}
+            </section>
+          )}
+
+          <section className="card" aria-labelledby="apps-title">
+            <div className="section-head">
+              <h2 id="apps-title" className="section-title">
+                Applications
+              </h2>
+              <button type="button" className="btn" onClick={apps.reload}>
+                Refresh
+              </button>
+            </div>
+
+            {apps.loading && !apps.data && (
+              <LoadingNotice label="Reading your installed applications…" />
+            )}
+            {apps.error && <ErrorNotice message={apps.error} onRetry={apps.reload} />}
+
+            {apps.data && (
+              <>
+                <div className="stats-grid app-stats">
+                  <StatCard
+                    title="Installed by you"
+                    value={formatCount(apps.data.userCount)}
+                    subtitleOf={`${formatBytes(apps.data.userBytes)} across non-system apps`}
+                  />
+                  <StatCard
+                    title="System apps"
+                    value={formatCount(apps.data.systemCount)}
+                    subtitleOf={`${formatBytes(apps.data.systemBytes)} marked by your system`}
+                  />
+                </div>
+                <div className="app-columns">
+                  <AppColumn
+                    title="Non-system applications"
+                    apps={apps.data.userApps}
+                    empty="No non-system applications were found."
+                  />
+                  <AppColumn
+                    title="System apps"
+                    apps={apps.data.systemApps}
+                    empty="No system applications were found."
+                  />
+                </div>
+                <ul className="notes-list">
+                  {apps.data.notes.map((note) => (
+                    <li key={note}>{note}</li>
+                  ))}
+                </ul>
+              </>
+            )}
+          </section>
 
           {data.prediction && (
             <section className="card prediction-card" aria-labelledby="prediction-title">

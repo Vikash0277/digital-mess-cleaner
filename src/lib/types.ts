@@ -55,6 +55,46 @@ export interface CategoryStat {
   count: number;
 }
 
+export interface ExtensionStat {
+  ext: string;
+  bytes: number;
+  count: number;
+}
+
+export interface CategoryDetails {
+  category: string;
+  totalBytes: number;
+  fileCount: number;
+  byExtension: ExtensionStat[];
+  byFolder: FolderStat[];
+  largestFiles: FileEntry[];
+}
+
+export interface InstalledApp {
+  name: string;
+  publisher: string;
+  version: string;
+  installLocation: string;
+  bytes: number;
+  fileCount: number;
+  system: boolean;
+  sizeSource: string;
+  evidence: string;
+  confidence: number;
+}
+
+export interface InstalledApps {
+  systemApps: InstalledApp[];
+  userApps: InstalledApp[];
+  systemBytes: number;
+  userBytes: number;
+  systemCount: number;
+  userCount: number;
+  estimatedCount: number;
+  platform: string;
+  notes: string[];
+}
+
 export interface FolderStat {
   path: string;
   bytes: number;
