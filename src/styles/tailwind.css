@@ -1,0 +1,32 @@
+/* Tailwind 4.3.5 utility layer for new UI only.
+   Preflight is deliberately omitted so the existing token-based theme.css
+   styles are untouched. Every Tailwind value below comes from a theme.css
+   token, so light/dark and macOS/Windows behaviour stays identical. */
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+
+@theme inline {
+  --color-app: var(--bg-app);
+  --color-sidebar: var(--bg-sidebar);
+  --color-surface: var(--bg-surface);
+  --color-subtle: var(--bg-subtle);
+  --color-line: var(--border);
+  --color-line-strong: var(--border-strong);
+  --color-ink: var(--text);
+  --color-ink-secondary: var(--text-secondary);
+  --color-ink-muted: var(--text-muted);
+  --color-brand: var(--accent);
+  --color-brand-soft: var(--accent-soft);
+  --color-caution: var(--warning);
+  --color-danger: var(--danger);
+
+  --font-ui: var(--font-sans);
+  --text-ui-xs: var(--text-xs);
+  --text-ui-sm: var(--text-sm);
+  --text-ui-base: var(--text-base);
+  --spacing: var(--space-1);
+  --radius-panel: var(--radius-card);
+  --radius-ctl: var(--radius-control);
+  --radius-modal: var(--radius-dialog);
+  --shadow-panel: var(--shadow-md);
+}

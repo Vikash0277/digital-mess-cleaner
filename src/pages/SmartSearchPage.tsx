@@ -170,7 +170,7 @@ export function SmartSearchPage() {
       </div>
 
       <section className="card text-index-card" aria-labelledby="text-index-title">
-        <div className="text-index-head">
+        <div className="text-index-head flex flex-wrap items-start justify-between gap-2">
           <div>
             <h2 id="text-index-title" className="section-title">
               Text index coverage
@@ -180,7 +180,9 @@ export function SmartSearchPage() {
             </p>
           </div>
           {status && (
-            <span className="badge">{formatCount(status.indexed)} files searchable</span>
+            <span className="badge inline-flex items-center gap-2">
+              {formatCount(status.indexed)} files searchable
+            </span>
           )}
         </div>
         {status && (
@@ -218,7 +220,7 @@ export function SmartSearchPage() {
             />
           </div>
         )}
-        <div className="text-index-actions">
+        <div className="text-index-actions flex flex-wrap gap-2">
           {jobId ? (
             <button type="button" className="btn" onClick={() => void stopIndexing()}>
               Stop indexing
@@ -381,7 +383,7 @@ export function SmartSearchPage() {
             </p>
           </section>
 
-          <div className="search-pager" aria-label="Search result pages">
+          <div className="search-pager font-ui text-ui-sm" aria-label="Search result pages">
             <button
               type="button"
               className="btn"
