@@ -21,6 +21,20 @@ fn lock<'a>(state: &'a AppState) -> AppResult<std::sync::MutexGuard<'a, Connecti
     })
 }
 
+/// Shared by scan and text-index cancellation: both register a cancel flag in
+/// the same job registry so only one long-running job can own the database.
+fn cancel_job(app: &AppHandle, job_id: &str) -> AppResult<()> {
+    let state = app.state::<AppState>();
+    let registry = state
+        .cancels
+        .lock()
+        .map_err(|_| AppError::Internal("Cancellation lock was interrupted.".into()))?;
+    if let Some(flag) = registry.get(job_id) {
+        flag.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
 async fn with_db<T, F>(app: AppHandle, f: F) -> AppResult<T>
 where
     T: Send + 'static,
@@ -446,15 +460,7 @@ fn scan_one_root(
 
 #[tauri::command(async)]
 pub fn scan_cancel(app: AppHandle, scan_id: String) -> AppResult<()> {
-    let state = app.state::<AppState>();
-    let registry = state
-        .cancels
-        .lock()
-        .map_err(|_| AppError::Internal("Cancellation lock was interrupted.".into()))?;
-    if let Some(flag) = registry.get(&scan_id) {
-        flag.store(true, Ordering::Relaxed);
-    }
-    Ok(())
+    cancel_job(&app, &scan_id)
 }
 
 #[tauri::command(async)]
@@ -583,17 +589,156 @@ pub fn analyze_folder(
 }
 
 // ---------------------------------------------------------------------------
-// Search + Ask
+// Full-text index
 // ---------------------------------------------------------------------------
 
 #[tauri::command(async)]
-pub fn search_files(
-    state: State<'_, AppState>,
+pub fn text_index_status(state: State<'_, AppState>) -> AppResult<TextIndexStatus> {
+    let conn = lock(&state)?;
+    intelligence::text_index_status(&conn)
+}
+
+#[tauri::command(async)]
+pub fn fts_check(state: State<'_, AppState>) -> AppResult<bool> {
+    let conn = lock(&state)?;
+    Ok(conn
+        .execute(
+            "INSERT INTO files_fts(files_fts) VALUES ('integrity-check')",
+            [],
+        )
+        .is_ok())
+}
+
+#[tauri::command]
+pub async fn fts_rebuild(app: AppHandle) -> AppResult<()> {
+    with_db_write(app, move |conn, _| {
+        conn.execute("INSERT INTO files_fts(files_fts) VALUES ('rebuild')", [])?;
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub fn text_index_cancel(app: AppHandle, job_id: String) -> AppResult<()> {
+    cancel_job(&app, &job_id)
+}
+
+#[tauri::command(async)]
+pub fn text_index_start(app: AppHandle, limit: Option<i64>) -> AppResult<String> {
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let state = app.state::<AppState>();
+        let mut registry = state
+            .cancels
+            .lock()
+            .map_err(|_| AppError::Internal("Cancellation lock was interrupted.".into()))?;
+        if !registry.is_empty() {
+            return Err(AppError::Invalid(
+                "Another scan or index job is already running.".into(),
+            ));
+        }
+        registry.insert(job_id.clone(), cancel.clone());
+    }
+
+    let app2 = app.clone();
+    let id2 = job_id.clone();
+    let cancel2 = cancel.clone();
+    std::thread::spawn(move || {
+        let state = app2.state::<AppState>();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_text_index(&app2, &state, &cancel2, limit.unwrap_or(2000))
+        }));
+        if let Ok(mut registry) = state.cancels.lock() {
+            registry.remove(&id2);
+        }
+        match outcome {
+            Ok(Ok(report)) => {
+                let _ = app2.emit("textindex://done", serde_json::json!({ "report": report }));
+            }
+            Ok(Err(e)) => {
+                let _ = app2.emit(
+                    "textindex://done",
+                    serde_json::json!({ "error": e.to_string() }),
+                );
+            }
+            Err(_) => {
+                let _ = app2.emit(
+                    "textindex://done",
+                    serde_json::json!({
+                        "error": "Text indexing stopped unexpectedly. Your files were not changed."
+                    }),
+                );
+            }
+        }
+    });
+    Ok(job_id)
+}
+
+fn run_text_index(
+    app: &AppHandle,
+    state: &AppState,
+    cancel: &Arc<AtomicBool>,
+    limit: i64,
+) -> AppResult<TextIndexReport> {
+    let started = Instant::now();
+    let targets = {
+        let conn = lock(state)?;
+        intelligence::pending_targets(&conn, limit)?
+    };
+    let total = targets.len() as i64;
+    let mut indexed = 0i64;
+    let mut unsupported = 0i64;
+    let mut failed = 0i64;
+    let mut cancelled = false;
+
+    for (index, (file_id, path)) in targets.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            break;
+        }
+        let _ = app.emit(
+            "textindex://progress",
+            serde_json::json!({ "done": index, "total": total, "currentPath": path }),
+        );
+        let result = {
+            let conn = lock(state)?;
+            intelligence::extract_and_store_text(&conn, *file_id)
+        };
+        match result {
+            Ok(Some(_)) => indexed += 1,
+            Ok(None) => unsupported += 1,
+            Err(_) => failed += 1,
+        }
+    }
+
+    {
+        let conn = lock(state)?;
+        storage::invalidate_totals(&conn);
+    }
+    Ok(TextIndexReport {
+        indexed,
+        unsupported,
+        failed,
+        cancelled,
+        took_ms: started.elapsed().as_millis() as i64,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Search + Ask
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn search_files(
+    app: AppHandle,
     query: String,
     filters: Option<SearchFilters>,
 ) -> AppResult<SearchResponse> {
-    let conn = lock(&state)?;
-    search::search(&conn, &query, filters.unwrap_or_default())
+    with_db(app, move |conn, _| {
+        search::search(conn, &query, filters.unwrap_or_default())
+    })
+    .await
 }
 
 #[tauri::command(async)]

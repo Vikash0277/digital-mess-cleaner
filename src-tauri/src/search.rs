@@ -1,6 +1,6 @@
 //! Metadata, full-text and natural-language search plus "Ask My Files" answers.
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::fsutil;
 use crate::models::*;
 use crate::repo;
@@ -13,6 +13,10 @@ use std::time::Instant;
 
 pub struct ParsedQuery {
     pub tokens: Vec<String>,
+    /// Exact phrases typed with double quotes, e.g. "electricity bill".
+    pub phrases: Vec<String>,
+    /// Whitelisted FTS column hints, e.g. `content:invoice`.
+    pub fields: Vec<(String, String)>,
     pub interpretation: Vec<String>,
     pub filters: SearchFilters,
     pub sort: Option<String>,
@@ -55,9 +59,49 @@ fn year_bounds(year: i32) -> (i64, i64) {
 }
 
 pub fn parse_query(input: &str, mut filters: SearchFilters) -> ParsedQuery {
-    let mut working = input.to_string();
     let mut interpretation: Vec<String> = Vec::new();
     let mut sort: Option<String> = None;
+    let mut phrases: Vec<String> = Vec::new();
+    let mut fields: Vec<(String, String)> = Vec::new();
+
+    // Pull out exact phrases first so their words are not eaten by the
+    // natural-language filter rules below.
+    let chars: Vec<char> = input.chars().collect();
+    let mut without_phrases = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '"' {
+            if let Some(relative) = chars[index + 1..].iter().position(|c| *c == '"') {
+                let phrase: String = chars[index + 1..index + 1 + relative].iter().collect();
+                let phrase = phrase.trim();
+                if !phrase.is_empty() {
+                    phrases.push(phrase.to_string());
+                    interpretation.push(format!("Exact phrase: {phrase}"));
+                }
+                index += relative + 2;
+                continue;
+            }
+        }
+        without_phrases.push(chars[index]);
+        index += 1;
+    }
+
+    let mut working = without_phrases;
+    for (field, pattern) in [
+        ("name", r#"(?i)\bname:\s*([^\s"]+)"#),
+        ("path", r#"(?i)\bpath:\s*([^\s"]+)"#),
+        ("content", r#"(?i)\bcontent:\s*([^\s"]+)"#),
+    ] {
+        let field_pattern = re(pattern);
+        for captures in field_pattern.captures_iter(&working) {
+            let value = captures[1].to_lowercase();
+            if value.chars().count() >= 2 {
+                fields.push((field.to_string(), value.clone()));
+                interpretation.push(format!("Text in {field}: {value}"));
+            }
+        }
+        working = field_pattern.replace_all(&working, " ").to_string();
+    }
 
     let low = working.to_lowercase();
 
@@ -370,6 +414,8 @@ pub fn parse_query(input: &str, mut filters: SearchFilters) -> ParsedQuery {
 
     ParsedQuery {
         tokens,
+        phrases,
+        fields,
         interpretation,
         filters,
         sort,
@@ -443,77 +489,241 @@ fn order_sql(sort: Option<&str>) -> &'static str {
     }
 }
 
-pub fn search(conn: &Connection, query: &str, filters: SearchFilters) -> AppResult<SearchResponse> {
-    let started = Instant::now();
-    let parsed = parse_query(query, filters);
-    let limit = parsed.filters.limit.unwrap_or(200).clamp(1, 1000);
-    let mut hits: Vec<SearchHit> = Vec::new();
-    let mut mode = "metadata".to_string();
+/// Full-text results can be ranked by FTS relevance, but the user's explicit
+/// sort always wins. Returned strings are fixed SQL fragments, never input.
+fn fts_order_sql(sort: Option<&str>) -> &'static str {
+    match sort {
+        None | Some("") | Some("relevance") => "rank",
+        Some("newest") => "f.mtime DESC",
+        Some("oldest") => "f.mtime ASC",
+        Some("largest") => "f.size DESC",
+        Some(_) => order_sql(sort),
+    }
+}
 
-    if !parsed.tokens.is_empty() {
-        let fts = parsed
-            .tokens
-            .iter()
-            .map(|t| format!("\"{}\"*", t.replace('"', "")))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let columns = repo::FILE_COLUMNS
-            .split(',')
-            .map(|c| format!("f.{}", c.trim()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT {columns}, f.content_text, bm25(files_fts) AS rank
-             FROM files f JOIN files_fts ON files_fts.rowid = f.id
-             WHERE files_fts MATCH ?"
-        );
-        let mut values: Vec<Value> = vec![Value::Text(fts.clone())];
-        let mut clauses: Vec<String> = Vec::new();
-        push_filter_sql(&parsed.filters, &mut clauses, &mut values);
-        let mut sql = sql;
-        if !clauses.is_empty() {
-            sql.push_str(" AND ");
-            sql.push_str(&clauses.join(" AND "));
+/// Keep only word characters. Quotes were handled by `parse_query`, and FTS5
+/// operators never reach the expression from user input.
+fn fts_term(raw: &str) -> String {
+    raw.chars().filter(|c| c.is_alphanumeric()).collect()
+}
+
+/// Phrases keep their spaces; only characters that could alter FTS5 syntax are
+/// dropped. The tokenizer still splits on punctuation inside the quotes.
+fn fts_phrase(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect()
+}
+
+fn build_fts_expression(parsed: &ParsedQuery) -> AppResult<String> {
+    let mut terms: Vec<String> = Vec::new();
+
+    for phrase in &parsed.phrases {
+        let clean = fts_phrase(phrase);
+        if !clean.is_empty() {
+            terms.push(format!("\"{clean}\""));
         }
-        sql.push_str(" ORDER BY rank LIMIT ?");
-        values.push(Value::Integer(limit));
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(values.iter()), |row| {
-            let file = repo::row_to_file(row)?;
-            let content: Option<String> = row.get(18)?;
-            let rank: f64 = row.get(19).unwrap_or(0.0);
-            Ok((file, content, rank))
-        })?;
-        for (file, content, rank) in rows.flatten() {
-            let snippet = build_snippet(&parsed.tokens, content.as_deref(), &file);
-            let matched_on = matched_field(&parsed.tokens, content.as_deref(), &file);
-            hits.push(SearchHit {
-                file,
-                snippet,
-                matched_on,
-                score: 1.0 / (1.0 + rank.abs()),
-            });
+    }
+    for (field, value) in &parsed.fields {
+        let column = match field.as_str() {
+            "name" => "name",
+            "path" => "path",
+            "content" => "content_text",
+            _ => continue,
+        };
+        let clean = fts_term(value);
+        if !clean.is_empty() {
+            terms.push(format!("{column}:\"{clean}\"*"));
         }
-        if !hits.is_empty() {
-            mode = "full-text".into();
+    }
+    for token in &parsed.tokens {
+        let clean = fts_term(token);
+        if !clean.is_empty() {
+            terms.push(format!("\"{clean}\"*"));
         }
     }
 
-    // Fallback: metadata-only matching so new or unanalyzed files still appear.
-    if hits.is_empty() {
-        let columns = repo::FILE_COLUMNS
-            .split(',')
-            .map(|c| format!("f.{}", c.trim()))
-            .collect::<Vec<_>>()
-            .join(", ");
+    if terms.len() > 12 {
+        return Err(AppError::Invalid(
+            "That search has too many words. Try fewer terms.".into(),
+        ));
+    }
+    Ok(terms.join(" AND "))
+}
+
+/// SQLite writes these sentinels around matched words in `highlight()`.
+const HL_OPEN: char = '\u{1}';
+const HL_CLOSE: char = '\u{2}';
+
+fn parse_highlighted(marked: &str) -> (Option<String>, Vec<SnippetPart>) {
+    if !marked.contains(HL_OPEN) && !marked.contains(HL_CLOSE) {
+        return (None, Vec::new());
+    }
+    let mut plain = String::new();
+    let mut parts: Vec<SnippetPart> = Vec::new();
+    let mut current = String::new();
+    let mut highlight = false;
+    for ch in marked.chars() {
+        match ch {
+            HL_OPEN => {
+                if !current.is_empty() {
+                    parts.push(SnippetPart {
+                        text: std::mem::take(&mut current),
+                        highlight,
+                    });
+                }
+                highlight = true;
+            }
+            HL_CLOSE => {
+                if !current.is_empty() {
+                    parts.push(SnippetPart {
+                        text: std::mem::take(&mut current),
+                        highlight,
+                    });
+                }
+                highlight = false;
+            }
+            '\n' | '\r' | '\t' => {
+                current.push(' ');
+                plain.push(' ');
+            }
+            _ => {
+                current.push(ch);
+                plain.push(ch);
+            }
+        }
+    }
+    if !current.is_empty() {
+        parts.push(SnippetPart {
+            text: current,
+            highlight,
+        });
+    }
+    if plain.is_empty() {
+        (None, Vec::new())
+    } else {
+        (Some(plain), parts)
+    }
+}
+
+fn plain_snippet_parts(text: &str) -> Vec<SnippetPart> {
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![SnippetPart {
+            text: text.to_string(),
+            highlight: false,
+        }]
+    }
+}
+
+pub fn search(conn: &Connection, query: &str, filters: SearchFilters) -> AppResult<SearchResponse> {
+    let started = Instant::now();
+    if query.chars().count() > 500 {
+        return Err(AppError::Invalid(
+            "That search is too long. Try a shorter search.".into(),
+        ));
+    }
+    let parsed = parse_query(query, filters);
+    // Natural-language words such as "oldest" override an explicit sort from
+    // the UI; otherwise the caller's sort is the one that matters.
+    let sort = parsed.sort.as_deref().or(parsed.filters.sort.as_deref());
+    let limit = parsed.filters.limit.unwrap_or(200).clamp(1, 1000);
+    let offset = parsed.filters.offset.unwrap_or(0).max(0);
+    let columns = repo::FILE_COLUMNS
+        .split(',')
+        .map(|c| format!("f.{}", c.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut hits: Vec<SearchHit> = Vec::new();
+    let mut mode = "metadata".to_string();
+    let mut total = 0i64;
+
+    let fts = build_fts_expression(&parsed)?;
+    if !fts.is_empty() {
+        let mut values: Vec<Value> = vec![Value::Text(fts)];
+        let mut clauses: Vec<String> = Vec::new();
+        push_filter_sql(&parsed.filters, &mut clauses, &mut values);
+        let where_sql = if clauses.is_empty() {
+            " FROM files f JOIN files_fts ON files_fts.rowid = f.id WHERE files_fts MATCH ?"
+                .to_string()
+        } else {
+            format!(
+                " FROM files f JOIN files_fts ON files_fts.rowid = f.id WHERE files_fts MATCH ? AND {}",
+                clauses.join(" AND ")
+            )
+        };
+
+        let count_sql = format!("SELECT count(*){where_sql}");
+        total = conn.query_row(&count_sql, params_from_iter(values.iter()), |r| r.get(0))?;
+
+        if total > 0 {
+            let sql = format!(
+                "SELECT {columns}, f.content_text, bm25(files_fts) AS rank, \
+                 highlight(files_fts, 2, char(1), char(2)) AS fts_snippet \
+                 {where_sql} ORDER BY {} LIMIT ? OFFSET ?",
+                fts_order_sql(sort)
+            );
+            let mut row_values = values.clone();
+            row_values.push(Value::Integer(limit));
+            row_values.push(Value::Integer(offset));
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(row_values.iter()), |row| {
+                let file = repo::row_to_file(row)?;
+                let content: Option<String> = row.get(18)?;
+                let rank: f64 = row.get(19).unwrap_or(0.0);
+                let marked: Option<String> = row.get(20)?;
+                Ok((file, content, rank, marked))
+            })?;
+            for (file, content, rank, marked) in rows.flatten() {
+                let (snippet, parts) = match parse_highlighted(marked.as_deref().unwrap_or("")) {
+                    (Some(plain), parts) if !plain.is_empty() => (plain, parts),
+                    _ => {
+                        let fallback = build_snippet(&parsed.tokens, content.as_deref(), &file);
+                        let parts = plain_snippet_parts(&fallback);
+                        (fallback, parts)
+                    }
+                };
+                let matched_on = matched_field(&parsed.tokens, content.as_deref(), &file);
+                hits.push(SearchHit {
+                    file,
+                    snippet,
+                    snippet_parts: parts,
+                    matched_on,
+                    score: 1.0 / (1.0 + rank.abs()),
+                });
+            }
+            if !hits.is_empty() {
+                mode = "full-text".into();
+            }
+        }
+    }
+
+    // Best-effort substring fallback for words the tokenizer splits, e.g. a
+    // search inside a longer identifier. Only runs when FTS found nothing.
+    if total == 0 {
         let mut clauses: Vec<String> = Vec::new();
         let mut values: Vec<Value> = Vec::new();
         for token in &parsed.tokens {
-            clauses.push("(lower(f.name) LIKE ? OR lower(f.path) LIKE ? OR lower(COALESCE(f.content_text,'')) LIKE ?)".into());
-            let like = format!("%{token}%");
-            values.push(Value::Text(like.clone()));
-            values.push(Value::Text(like.clone()));
+            if token.is_empty() {
+                continue;
+            }
+            clauses.push("(f.name LIKE ? COLLATE NOCASE OR f.path LIKE ? COLLATE NOCASE OR lower(COALESCE(f.content_text,'')) LIKE ?)".into());
+            let prefix = format!("{token}%");
+            let anywhere = format!("%{token}%");
+            values.push(Value::Text(prefix.clone()));
+            values.push(Value::Text(prefix));
+            values.push(Value::Text(anywhere));
+        }
+        for phrase in &parsed.phrases {
+            clauses.push(
+                "(lower(COALESCE(f.content_text,'')) LIKE ? OR f.name LIKE ? COLLATE NOCASE)"
+                    .into(),
+            );
+            let like = format!("%{}%", phrase.to_lowercase());
             values.push(Value::Text(like));
+            values.push(Value::Text(format!("{phrase}%")));
         }
         push_filter_sql(&parsed.filters, &mut clauses, &mut values);
         let where_sql = if clauses.is_empty() {
@@ -521,33 +731,42 @@ pub fn search(conn: &Connection, query: &str, filters: SearchFilters) -> AppResu
         } else {
             clauses.join(" AND ")
         };
-        let sql = format!(
-            "SELECT {columns}, f.content_text FROM files f WHERE {where_sql} ORDER BY {} LIMIT ?",
-            order_sql(parsed.sort.as_deref())
-        );
-        values.push(Value::Integer(limit));
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(values.iter()), |row| {
-            let file = repo::row_to_file(row)?;
-            let content: Option<String> = row.get(18)?;
-            Ok((file, content))
-        })?;
-        for (file, content) in rows.flatten() {
-            let snippet = build_snippet(&parsed.tokens, content.as_deref(), &file);
-            let matched_on = matched_field(&parsed.tokens, content.as_deref(), &file);
-            hits.push(SearchHit {
-                file,
-                snippet,
-                matched_on,
-                score: 0.5,
-            });
-        }
-        if !hits.is_empty() {
-            mode = "metadata".into();
+
+        let count_sql = format!("SELECT count(*) FROM files f WHERE {where_sql}");
+        total = conn.query_row(&count_sql, params_from_iter(values.iter()), |r| r.get(0))?;
+
+        if total > 0 {
+            let sql = format!(
+                "SELECT {columns}, f.content_text FROM files f WHERE {where_sql} ORDER BY {} LIMIT ? OFFSET ?",
+                order_sql(sort)
+            );
+            let mut row_values = values.clone();
+            row_values.push(Value::Integer(limit));
+            row_values.push(Value::Integer(offset));
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(row_values.iter()), |row| {
+                let file = repo::row_to_file(row)?;
+                let content: Option<String> = row.get(18)?;
+                Ok((file, content))
+            })?;
+            for (file, content) in rows.flatten() {
+                let snippet = build_snippet(&parsed.tokens, content.as_deref(), &file);
+                let parts = plain_snippet_parts(&snippet);
+                let matched_on = matched_field(&parsed.tokens, content.as_deref(), &file);
+                hits.push(SearchHit {
+                    file,
+                    snippet,
+                    snippet_parts: parts,
+                    matched_on,
+                    score: 0.5,
+                });
+            }
+            if !hits.is_empty() {
+                mode = "metadata".into();
+            }
         }
     }
 
-    let total = hits.len() as i64;
     Ok(SearchResponse {
         query: query.to_string(),
         interpretation: parsed.interpretation,
@@ -586,19 +805,37 @@ fn build_snippet(tokens: &[String], content: Option<&str>, file: &FileEntry) -> 
     if source.is_empty() {
         return file.path.clone();
     }
-    let lower = source.to_lowercase();
+
+    // Work on characters, never raw byte offsets: file text is arbitrary UTF-8
+    // and slicing at a byte boundary could panic the whole search command.
+    let chars: Vec<char> = source.chars().collect();
+    let lower: Vec<char> = chars
+        .iter()
+        .map(|c| c.to_lowercase().next().unwrap_or(*c))
+        .collect();
     let mut best: Option<(usize, String)> = None;
+
     for token in tokens {
-        if let Some(pos) = lower.find(token) {
-            let start = pos.saturating_sub(90);
-            let end = (pos + token.len() + 150).min(source.len());
+        let needle: Vec<char> = token.chars().collect();
+        if needle.is_empty() || needle.len() > lower.len() {
+            continue;
+        }
+        let mut found = None;
+        for start in 0..=lower.len() - needle.len() {
+            if lower[start..start + needle.len()] == needle[..] {
+                found = Some(start);
+                break;
+            }
+        }
+        if let Some(pos) = found {
+            let from = pos.saturating_sub(90);
+            let to = (pos + needle.len() + 150).min(chars.len());
             let mut snippet = String::new();
-            if start > 0 {
+            if from > 0 {
                 snippet.push('…');
             }
-            let slice = &source[start..end];
-            snippet.push_str(slice.trim());
-            if end < source.len() {
+            snippet.extend(chars[from..to].iter());
+            if to < chars.len() {
                 snippet.push('…');
             }
             if best.as_ref().map(|(p, _)| pos < *p).unwrap_or(true) {
@@ -606,6 +843,7 @@ fn build_snippet(tokens: &[String], content: Option<&str>, file: &FileEntry) -> 
             }
         }
     }
+
     best.map(|(_, s)| fsutil::normalize_ws(&s))
         .unwrap_or_else(|| fsutil::truncate_chars(&fsutil::normalize_ws(source), 220))
 }
@@ -767,6 +1005,7 @@ pub fn ask(conn: &Connection, question: &str) -> AppResult<AskAnswer> {
             .take(6)
             .map(|file| SearchHit {
                 snippet: file.path.clone(),
+                snippet_parts: Vec::new(),
                 file,
                 matched_on: "last modified".into(),
                 score: 0.6,
@@ -880,5 +1119,178 @@ mod tests {
     fn size_parsing() {
         let parsed = parse_query("videos over 2 gb", SearchFilters::default());
         assert_eq!(parsed.filters.min_size, Some(2 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parses_phrases_and_field_hints() {
+        let parsed = parse_query(
+            "content:invoice \"electricity bill\"",
+            SearchFilters::default(),
+        );
+        assert_eq!(parsed.phrases, vec!["electricity bill".to_string()]);
+        assert_eq!(
+            parsed.fields,
+            vec![("content".to_string(), "invoice".to_string())]
+        );
+        let expression = build_fts_expression(&parsed).unwrap();
+        assert_eq!(
+            expression,
+            "\"electricity bill\" AND content_text:\"invoice\"*"
+        );
+    }
+
+    fn seed_search_db() -> Connection {
+        let conn = crate::db::open_in_memory().unwrap();
+        conn.execute(
+            "INSERT INTO roots(id,path,label,kind,created_at) VALUES (1,'C:\\Docs','Docs','folder',0)",
+            [],
+        )
+        .unwrap();
+        for (id, name, text) in [
+            (1, "one.txt", "electricity bill for april"),
+            (2, "two.txt", "electricity statement for may"),
+            (3, "three.txt", "water bill for june"),
+        ] {
+            conn.execute(
+                "INSERT INTO files(id,root_id,path,parent_path,name,ext,size,indexed_at,last_seen_at,content_text,category)
+                 VALUES (?1,1,?2,'C:\\Docs',?3,'txt',10,0,0,?4,'documents')",
+                rusqlite::params![id, format!("C:\\Docs\\{name}"), name, text],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn search_returns_real_total_and_pages() {
+        let conn = seed_search_db();
+        let first = search(
+            &conn,
+            "electricity",
+            SearchFilters {
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(first.total, 2);
+        assert_eq!(first.hits.len(), 1);
+        assert_eq!(first.mode, "full-text");
+
+        let second = search(
+            &conn,
+            "electricity",
+            SearchFilters {
+                limit: Some(1),
+                offset: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(second.total, 2);
+        assert_ne!(second.hits[0].file.id, first.hits[0].file.id);
+    }
+
+    #[test]
+    fn explicit_sort_applies_to_full_text_results() {
+        let conn = seed_search_db();
+        let sorted = search(
+            &conn,
+            "electricity",
+            SearchFilters {
+                sort: Some("name_desc".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(sorted.hits.len(), 2);
+        assert_eq!(sorted.hits[0].file.name, "two.txt");
+        assert_eq!(sorted.hits[1].file.name, "one.txt");
+    }
+
+    #[test]
+    fn phrase_and_field_searches_are_safe() {
+        let conn = seed_search_db();
+        let phrase = search(&conn, "\"electricity bill\"", SearchFilters::default()).unwrap();
+        assert_eq!(phrase.total, 1);
+        assert_eq!(phrase.hits[0].file.id, 1);
+
+        let field = search(&conn, "content:water", SearchFilters::default()).unwrap();
+        assert_eq!(field.total, 1);
+        assert_eq!(field.hits[0].file.id, 3);
+
+        // FTS5 operators are never passed through: both terms must match.
+        let operators = search(&conn, "electricity OR \"bill\"", SearchFilters::default()).unwrap();
+        assert_eq!(operators.total, 1);
+
+        let long = "word ".repeat(120);
+        assert!(search(&conn, &long, SearchFilters::default()).is_err());
+    }
+
+    #[test]
+    fn fts_triggers_keep_index_in_sync() {
+        let conn = seed_search_db();
+        conn.execute(
+            "UPDATE files SET content_text='solar panel guide' WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            search(&conn, "electricity", SearchFilters::default())
+                .unwrap()
+                .total,
+            1
+        );
+        assert_eq!(
+            search(&conn, "solar", SearchFilters::default())
+                .unwrap()
+                .total,
+            1
+        );
+        conn.execute("DELETE FROM files WHERE id=1", []).unwrap();
+        assert_eq!(
+            search(&conn, "solar", SearchFilters::default())
+                .unwrap()
+                .total,
+            0
+        );
+    }
+
+    #[test]
+    fn snippets_are_utf8_safe_and_highlighted() {
+        let conn = seed_search_db();
+        let hit = search(&conn, "electricity", SearchFilters::default())
+            .unwrap()
+            .hits
+            .remove(0);
+        assert!(hit
+            .snippet_parts
+            .iter()
+            .any(|part| { part.highlight && part.text.to_lowercase().contains("electricity") }));
+
+        let unicode = format!("{} bill 😀 {}", "é".repeat(120), "notes".repeat(40));
+        let file = FileEntry {
+            id: 99,
+            root_id: 1,
+            path: "C:\\Docs\\unicode.txt".into(),
+            parent_path: "C:\\Docs".into(),
+            name: "unicode.txt".into(),
+            ext: "txt".into(),
+            size: 10,
+            mtime: 0,
+            atime: 0,
+            ctime: 0,
+            category: "documents".into(),
+            mime: "text/plain".into(),
+            tags: Vec::new(),
+            doc_type: None,
+            confidence: 1.0,
+            sensitive: false,
+            analyzed: true,
+            hash: None,
+            snippet: None,
+        };
+        let snippet = build_snippet(&["bill".to_string()], Some(&unicode), &file);
+        assert!(snippet.contains("bill"));
     }
 }

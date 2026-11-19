@@ -1,6 +1,6 @@
 [package]
 name = "digital-mess-cleaner"
-version = "0.1.4"
+version = "0.2.0"
 description = "Your files. Understood. Organised. Clean."
 authors = ["Digital Mess Cleaner"]
 edition = "2021"

@@ -15,6 +15,7 @@ import type {
   FilePreview,
   FolderStat,
   InstalledApps,
+  TextIndexStatus,
   MediaOverview,
   OperationEntry,
   Page,
@@ -125,6 +126,11 @@ export const api = {
     }),
   searchFiles: (query: string, filters?: SearchFilters) =>
     call<SearchResponse>("search_files", { query, filters: filters ?? {} }),
+  textIndexStatus: () => call<TextIndexStatus>("text_index_status"),
+  textIndexStart: (limit?: number) => call<string>("text_index_start", { limit: limit ?? null }),
+  textIndexCancel: (jobId: string) => call<void>("text_index_cancel", { jobId }),
+  ftsCheck: () => call<boolean>("fts_check"),
+  ftsRebuild: () => call<void>("fts_rebuild"),
   askFiles: (question: string) => call<AskAnswer>("ask_files", { question }),
 
   duplicatesAnalyze: (mode: string, threshold?: number) =>

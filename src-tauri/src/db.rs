@@ -71,6 +71,8 @@ CREATE INDEX IF NOT EXISTS idx_files_category  ON files(category);
 CREATE INDEX IF NOT EXISTS idx_files_hash      ON files(hash);
 CREATE INDEX IF NOT EXISTS idx_files_phash     ON files(phash);
 CREATE INDEX IF NOT EXISTS idx_files_parent    ON files(parent_path);
+CREATE INDEX IF NOT EXISTS idx_files_name_nocase ON files(name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_files_content_status ON files(content_status);
 CREATE INDEX IF NOT EXISTS idx_files_doc_type  ON files(doc_type);
 CREATE INDEX IF NOT EXISTS idx_files_sensitive ON files(sensitive);
 CREATE INDEX IF NOT EXISTS idx_files_size_mtime ON files(size, mtime);

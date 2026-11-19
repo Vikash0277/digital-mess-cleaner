@@ -47,6 +47,13 @@ export interface FileEntry {
   analyzed: boolean;
   hash: string | null;
   snippet: string | null;
+  /** Highlighted parts of `snippet`, supplied by the local FTS5 index. */
+  snippetParts?: SnippetPart[];
+}
+
+export interface SnippetPart {
+  text: string;
+  highlight: boolean;
 }
 
 export interface FileDetails {
@@ -217,12 +224,14 @@ export interface SearchFilters {
   modifiedBefore?: number | null;
   sensitiveOnly?: boolean;
   limit?: number | null;
+  offset?: number | null;
   sort?: string | null;
 }
 
 export interface SearchHit {
   file: FileEntry;
   snippet: string;
+  snippetParts: SnippetPart[];
   matchedOn: string;
   score: number;
 }
@@ -234,6 +243,31 @@ export interface SearchResponse {
   total: number;
   tookMs: number;
   mode: string;
+}
+
+export interface TextIndexStatus {
+  total: number;
+  indexed: number;
+  unsupported: number;
+  none: number;
+  missing: number;
+  ftsRows: number;
+  supportedRemaining: number;
+  lastIndexedAt: number;
+}
+
+export interface TextIndexReport {
+  indexed: number;
+  unsupported: number;
+  failed: number;
+  cancelled: boolean;
+  tookMs: number;
+}
+
+export interface TextIndexProgress {
+  done: number;
+  total: number;
+  currentPath: string;
 }
 
 export interface DuplicateGroup {

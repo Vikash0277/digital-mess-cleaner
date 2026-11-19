@@ -40,16 +40,34 @@ pub struct SensitiveHit {
 // Analysis
 // ---------------------------------------------------------------------------
 
+/// Read and store only the text layer for one file. Shared by document
+/// analysis and the full-text index job so extraction rules stay identical.
+/// Never changes the file on disk and never sends text off this device.
+pub fn extract_and_store_text(conn: &Connection, file_id: i64) -> AppResult<Option<String>> {
+    let file = repo::load_file(conn, file_id)?;
+    let path = Path::new(&file.path);
+    let text = if path.is_file() {
+        fsutil::extract_text(path, MAX_TEXT_CHARS).ok().flatten()
+    } else {
+        None
+    };
+    let status = if text.is_some() {
+        "indexed"
+    } else {
+        "unsupported"
+    };
+    conn.execute(
+        "UPDATE files SET content_text = ?2, content_status = ?3, analyzed_at = ?4 WHERE id = ?1",
+        params![file_id, text, status, fsutil::now_secs()],
+    )?;
+    Ok(text)
+}
+
 /// Analyse one indexed file: read its text locally, classify it, pull out the
 /// fields we can support without guessing, and store the result on the row.
 pub fn analyze_file(conn: &Connection, file_id: i64) -> AppResult<AnalysisOutcome> {
     let file = repo::load_file(conn, file_id)?;
-    let path = Path::new(&file.path);
-    let text = if path.is_file() {
-        fsutil::extract_text(path, MAX_TEXT_CHARS).unwrap_or(None)
-    } else {
-        None
-    };
+    let text = extract_and_store_text(conn, file_id)?;
     let text_ref = text.as_deref().unwrap_or("");
     let text_chars = text_ref.chars().count();
 
@@ -107,34 +125,24 @@ pub fn analyze_file(conn: &Connection, file_id: i64) -> AppResult<AnalysisOutcom
         });
     }
 
-    let content_status = if text.is_some() {
-        "indexed"
-    } else {
-        "unsupported"
-    };
     let evidence_json = serde_json::to_string(&evidence).unwrap_or_else(|_| "[]".into());
 
     conn.execute(
         "UPDATE files SET
-            content_text = ?2,
-            content_status = ?3,
-            doc_type = ?4,
-            confidence = ?5,
-            sensitive = ?6,
-            sensitive_kind = ?7,
-            vendor = ?8,
-            amount = ?9,
-            invoice_no = ?10,
-            doc_date = ?11,
-            due_date = ?12,
-            evidence = ?13,
-            summary = ?14,
-            analyzed_at = ?15
+            doc_type = ?2,
+            confidence = ?3,
+            sensitive = ?4,
+            sensitive_kind = ?5,
+            vendor = ?6,
+            amount = ?7,
+            invoice_no = ?8,
+            doc_date = ?9,
+            due_date = ?10,
+            evidence = ?11,
+            summary = ?12
          WHERE id = ?1",
         params![
             file_id,
-            text,
-            content_status,
             if doc_type == "other" {
                 None
             } else {
@@ -150,7 +158,6 @@ pub fn analyze_file(conn: &Connection, file_id: i64) -> AppResult<AnalysisOutcom
             due_date.map(|d| d.to_string()),
             evidence_json,
             summary,
-            fsutil::now_secs(),
         ],
     )?;
 
@@ -176,6 +183,45 @@ pub fn pending_targets(conn: &Connection, limit: i64) -> AppResult<Vec<(i64, Str
     )?;
     let rows = stmt.query_map([limit.clamp(1, 100_000)], |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(rows.filter_map(Result::ok).collect())
+}
+
+/// Local-only view of how much text is searchable. Counts come from the index,
+/// never from walking the user's folders.
+pub fn text_index_status(conn: &Connection) -> AppResult<TextIndexStatus> {
+    let row = conn.query_row(
+        "SELECT count(*),
+                COALESCE(sum(CASE WHEN content_status = 'indexed' THEN 1 ELSE 0 END), 0),
+                COALESCE(sum(CASE WHEN content_status = 'unsupported' THEN 1 ELSE 0 END), 0),
+                COALESCE(sum(CASE WHEN content_status = 'none' THEN 1 ELSE 0 END), 0),
+                COALESCE(sum(CASE WHEN content_status = 'missing' THEN 1 ELSE 0 END), 0),
+                COALESCE(max(analyzed_at), 0)
+         FROM files",
+        [],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        },
+    )?;
+    let fts_rows = conn
+        .query_row("SELECT count(*) FROM files_fts", [], |r| r.get::<_, i64>(0))
+        .unwrap_or(0);
+    let (total, indexed, unsupported, none, missing, last_indexed_at) = row;
+    Ok(TextIndexStatus {
+        total,
+        indexed,
+        unsupported,
+        none,
+        missing,
+        fts_rows,
+        supported_remaining: none,
+        last_indexed_at,
+    })
 }
 
 /// Analyse up to `limit` files that have not been read yet, reporting progress

@@ -143,4 +143,21 @@ describe("FileTable", () => {
     expect(screen.getByText("Nothing indexed yet.")).toBeInTheDocument();
     expect(screen.queryByRole("grid")).not.toBeInTheDocument();
   });
+
+  it("highlights FTS snippet parts as text, never as HTML", () => {
+    const withSnippet: FileEntry = {
+      ...makeFile(3, "Invoice.txt", 512),
+      snippet: "electricity bill",
+      snippetParts: [
+        { text: "electricity", highlight: true },
+        { text: " bill", highlight: false },
+      ],
+    };
+    const { container } = render(<FileTable files={[withSnippet]} caption="Matches" />);
+
+    const mark = container.querySelector("mark");
+    expect(mark).not.toBeNull();
+    expect(mark?.textContent).toBe("electricity");
+    expect(mark?.innerHTML).toBe("electricity");
+  });
 });

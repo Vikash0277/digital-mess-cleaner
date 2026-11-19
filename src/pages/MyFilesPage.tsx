@@ -53,12 +53,17 @@ export function MyFilesPage() {
       categories: category ? [category] : [],
       sort,
       limit: PAGE_SIZE,
+      offset: debouncedQuery.trim() ? offset : null,
     };
 
     if (debouncedQuery.trim()) {
       const response = await api.searchFiles(debouncedQuery.trim(), filters);
       return {
-        files: response.hits.map((hit) => ({ ...hit.file, snippet: hit.snippet })),
+        files: response.hits.map((hit) => ({
+          ...hit.file,
+          snippet: hit.snippet,
+          snippetParts: hit.snippetParts,
+        })),
         total: response.total,
         interpretation: response.interpretation,
         mode: response.mode,

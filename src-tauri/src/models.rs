@@ -206,13 +206,47 @@ pub struct Page<T> {
     pub limit: i64,
 }
 
+/// A piece of a search excerpt. Highlighting comes from FTS5's own marker
+/// output, so file contents are never treated as HTML.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnippetPart {
+    pub text: String,
+    pub highlight: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchHit {
     pub file: FileEntry,
     pub snippet: String,
+    pub snippet_parts: Vec<SnippetPart>,
     pub matched_on: String,
     pub score: f64,
+}
+
+/// How much of the local index has readable text. All counts are local only.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextIndexStatus {
+    pub total: i64,
+    pub indexed: i64,
+    pub unsupported: i64,
+    pub none: i64,
+    pub missing: i64,
+    pub fts_rows: i64,
+    pub supported_remaining: i64,
+    pub last_indexed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextIndexReport {
+    pub indexed: i64,
+    pub unsupported: i64,
+    pub failed: i64,
+    pub cancelled: bool,
+    pub took_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -238,6 +272,8 @@ pub struct SearchFilters {
     pub sensitive_only: bool,
     #[serde(default)]
     pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
     #[serde(default)]
     pub sort: Option<String>,
 }

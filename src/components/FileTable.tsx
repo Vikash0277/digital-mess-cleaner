@@ -152,7 +152,17 @@ export function FileTable({
                   <span className="file-table-name-text">
                     <span className="file-table-file-name">{file.name}</span>
                     {file.snippet && file.snippet !== file.path && (
-                      <span className="file-table-snippet">{file.snippet}</span>
+                      <span className="file-table-snippet">
+                        {file.snippetParts?.length
+                          ? file.snippetParts.map((part, index) =>
+                              part.highlight ? (
+                                <mark key={index}>{part.text}</mark>
+                              ) : (
+                                <span key={index}>{part.text}</span>
+                              ),
+                            )
+                          : file.snippet}
+                      </span>
                     )}
                   </span>
                 </span>

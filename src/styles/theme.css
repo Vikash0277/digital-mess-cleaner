@@ -3699,6 +3699,78 @@ pre,
   font-size: var(--text-sm);
 }
 
+/* ---------- Local text index + result paging ---------- */
+
+.text-index-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.text-index-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.text-index-head p {
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-sm);
+}
+
+.text-index-numbers {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: var(--space-2) var(--space-4);
+  margin: 0;
+}
+
+.text-index-numbers dt {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.text-index-numbers dd {
+  margin: 2px 0 0;
+  color: var(--text);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.text-index-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.text-index-progress {
+  max-width: 560px;
+}
+
+.search-pager,
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.file-table-snippet mark {
+  padding: 0 2px;
+  border-radius: 3px;
+  background: var(--accent-soft);
+  color: var(--accent-soft-text);
+}
+
 .interpretation {
   display: flex;
   flex-wrap: wrap;
