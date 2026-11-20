@@ -20,6 +20,9 @@ pub struct ParsedQuery {
     pub interpretation: Vec<String>,
     pub filters: SearchFilters,
     pub sort: Option<String>,
+    /// A pasted path or bare filename is searched literally. Natural-language
+    /// intent rules must not eat words such as `report`, `pdf` or `2026`.
+    pub literal: bool,
 }
 
 fn re(pat: &str) -> Regex {
@@ -58,7 +61,64 @@ fn year_bounds(year: i32) -> (i64, i64) {
     )
 }
 
+/// Pasted paths and bare filenames are literal lookups, not natural language.
+fn is_literal_query(input: &str) -> bool {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains('\\') || trimmed.contains('/') {
+        return true;
+    }
+    let mut words = trimmed.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    if words.next().is_some() {
+        return false;
+    }
+    match first.rsplit_once('.') {
+        Some((_, ext)) => {
+            !ext.is_empty()
+                && ext.chars().count() <= 8
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
+/// Literal mode keeps short numeric parts such as `11` and `17`, and ignores
+/// conversational stop words because they may be real folder or file names.
+fn literal_tokens(input: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    input
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|token| token.trim().to_lowercase())
+        .filter(|token| !token.is_empty())
+        .filter(|token| token.chars().all(|c| c.is_ascii_digit()) || token.chars().count() >= 2)
+        .filter(|token| seen.insert(token.clone()))
+        .collect()
+}
+
 pub fn parse_query(input: &str, mut filters: SearchFilters) -> ParsedQuery {
+    if is_literal_query(input) {
+        let tokens = literal_tokens(input);
+        let mut interpretation = vec![format!("Literal name/path: {}", input.trim())];
+        if !tokens.is_empty() {
+            interpretation.push(format!("Matching: {}", tokens.join(", ")));
+        }
+        let sort = filters.sort.clone();
+        return ParsedQuery {
+            tokens,
+            phrases: Vec::new(),
+            fields: Vec::new(),
+            interpretation,
+            filters,
+            sort,
+            literal: true,
+        };
+    }
+
     let mut interpretation: Vec<String> = Vec::new();
     let mut sort: Option<String> = None;
     let mut phrases: Vec<String> = Vec::new();
@@ -419,6 +479,7 @@ pub fn parse_query(input: &str, mut filters: SearchFilters) -> ParsedQuery {
         interpretation,
         filters,
         sort,
+        literal: false,
     }
 }
 
@@ -448,10 +509,19 @@ fn push_filter_sql(filters: &SearchFilters, clauses: &mut Vec<String>, values: &
             .take(filters.doc_types.len())
             .collect::<Vec<_>>()
             .join(",");
-        clauses.push(format!("f.doc_type IN ({marks})"));
+        let mut clause = format!("f.doc_type IN ({marks})");
         for c in &filters.doc_types {
             values.push(Value::Text(c.clone()));
         }
+        // A file can be a report by name or content without having been
+        // analysed yet. Keep the classifier as evidence, not as a gate.
+        if let Some(expression) = doc_type_fts_expression(&filters.doc_types) {
+            clause = format!(
+                "({clause} OR f.id IN (SELECT rowid FROM files_fts WHERE files_fts MATCH ?))"
+            );
+            values.push(Value::Text(expression));
+        }
+        clauses.push(clause);
     }
     if let Some(root) = filters.root_id {
         clauses.push("f.root_id = ?".into());
@@ -515,6 +585,26 @@ fn fts_phrase(raw: &str) -> String {
         .collect()
 }
 
+/// Document-type intent is inclusive: it also matches the name, path or text
+/// of files that have not been classified yet.
+fn doc_type_fts_expression(doc_types: &[String]) -> Option<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for doc_type in doc_types {
+        let clean = fts_term(doc_type);
+        if clean.is_empty() {
+            continue;
+        }
+        for column in ["name", "path", "content_text"] {
+            terms.push(format!("{column}:\"{clean}\"*"));
+        }
+    }
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" OR "))
+    }
+}
+
 fn build_fts_expression(parsed: &ParsedQuery) -> AppResult<String> {
     let mut terms: Vec<String> = Vec::new();
 
@@ -543,7 +633,8 @@ fn build_fts_expression(parsed: &ParsedQuery) -> AppResult<String> {
         }
     }
 
-    if terms.len() > 12 {
+    let max_terms = if parsed.literal { 32 } else { 12 };
+    if terms.len() > max_terms {
         return Err(AppError::Invalid(
             "That search has too many words. Try fewer terms.".into(),
         ));
@@ -724,6 +815,14 @@ pub fn search(conn: &Connection, query: &str, filters: SearchFilters) -> AppResu
             let like = format!("%{}%", phrase.to_lowercase());
             values.push(Value::Text(like));
             values.push(Value::Text(format!("{phrase}%")));
+        }
+        if parsed.literal {
+            // Covers separators and digit runs if the tokenizer split them
+            // differently from the pasted path.
+            let like = format!("%{}%", query.trim().to_lowercase());
+            clauses.push("(f.path LIKE ? COLLATE NOCASE OR f.name LIKE ? COLLATE NOCASE)".into());
+            values.push(Value::Text(like.clone()));
+            values.push(Value::Text(like));
         }
         push_filter_sql(&parsed.filters, &mut clauses, &mut values);
         let where_sql = if clauses.is_empty() {
@@ -1116,6 +1215,29 @@ mod tests {
     }
 
     #[test]
+    fn pasted_paths_and_filenames_are_literal() {
+        let path = r"C:\Users\91709\Downloads\Daily_Work_Report_2026-11-17.pdf";
+        let parsed = parse_query(path, SearchFilters::default());
+        assert!(parsed.literal);
+        assert!(parsed.tokens.contains(&"91709".to_string()));
+        assert!(parsed.tokens.contains(&"11".to_string()));
+        assert!(parsed.tokens.contains(&"17".to_string()));
+        assert!(parsed.filters.doc_types.is_empty());
+        assert!(parsed.filters.exts.is_empty());
+        assert!(parsed.filters.modified_after.is_none());
+
+        let name = "Daily_Work_Report_2026-11-17.pdf";
+        let parsed = parse_query(name, SearchFilters::default());
+        assert!(parsed.literal);
+        assert_eq!(parsed.tokens.len(), 7);
+        assert_eq!(
+            parsed.tokens,
+            vec!["daily", "work", "report", "2026", "11", "17", "pdf"]
+        );
+        assert!(build_fts_expression(&parsed).is_ok());
+    }
+
+    #[test]
     fn size_parsing() {
         let parsed = parse_query("videos over 2 gb", SearchFilters::default());
         assert_eq!(parsed.filters.min_size, Some(2 * 1024 * 1024 * 1024));
@@ -1158,6 +1280,17 @@ mod tests {
             )
             .unwrap();
         }
+        // An unanalysed PDF whose "report" evidence only exists in its name.
+        conn.execute(
+            "INSERT INTO files(id,root_id,path,parent_path,name,ext,size,indexed_at,last_seen_at,content_text,category)
+             VALUES (4,1,?1,'C:\\Users\\91709\\Downloads',?2,'pdf',?3,0,0,NULL,'documents')",
+            rusqlite::params![
+                r"C:\Users\91709\Downloads\Daily_Work_Report_2026-11-17.pdf",
+                "Daily_Work_Report_2026-11-17.pdf",
+                2 * 1024 * 1024
+            ],
+        )
+        .unwrap();
         conn
     }
 
@@ -1189,6 +1322,41 @@ mod tests {
         .unwrap();
         assert_eq!(second.total, 2);
         assert_ne!(second.hits[0].file.id, first.hits[0].file.id);
+    }
+
+    #[test]
+    fn literal_path_and_filename_find_unanalysed_file() {
+        let conn = seed_search_db();
+        let by_path = search(
+            &conn,
+            r"C:\Users\91709\Downloads\Daily_Work_Report_2026-11-17.pdf",
+            SearchFilters::default(),
+        )
+        .unwrap();
+        assert_eq!(by_path.total, 1);
+        assert_eq!(by_path.hits[0].file.id, 4);
+
+        let by_name = search(
+            &conn,
+            "Daily_Work_Report_2026-11-17.pdf",
+            SearchFilters::default(),
+        )
+        .unwrap();
+        assert_eq!(by_name.total, 1);
+        assert_eq!(by_name.hits[0].file.id, 4);
+    }
+
+    #[test]
+    fn document_type_words_match_unclassified_names() {
+        let conn = seed_search_db();
+        let reports = search(&conn, "report", SearchFilters::default()).unwrap();
+        assert_eq!(reports.total, 1);
+        assert_eq!(reports.hits[0].file.id, 4);
+        assert!(reports.hits[0].file.doc_type.is_none());
+
+        let filtered = search(&conn, "pdf reports over 1 MB", SearchFilters::default()).unwrap();
+        assert_eq!(filtered.total, 1);
+        assert_eq!(filtered.hits[0].file.id, 4);
     }
 
     #[test]
