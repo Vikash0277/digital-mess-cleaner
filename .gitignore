@@ -9,3 +9,4 @@ Thumbs.db
 src-tauri/target/
 src-tauri/gen/
 *.log
+config.bat
